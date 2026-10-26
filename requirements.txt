@@ -1,0 +1,9 @@
+# Python 3.12
+numpy==2.5.3
+scipy==1.18.1
+rasterio==1.5.1
+pillow==11.3.0
+scikit-learn==1.9.1
+joblib==1.6.0
+streamlit==1.64.0
+watchdog==6.0.0

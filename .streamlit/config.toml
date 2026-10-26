@@ -1,0 +1,6 @@
+# Bind locally by default.
+[server]
+address = "localhost"
+
+[browser]
+gatherUsageStats = false

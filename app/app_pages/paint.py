@@ -1,0 +1,633 @@
+"""Edit lunar unit annotations and review model predictions.
+
+Saving exports annotations and predictions separately. Explicitly approved
+predictions become labels with half the training weight of manual annotations.
+"""
+import datetime
+import os
+from pathlib import Path
+
+import numpy as np
+import streamlit as st
+from scipy import ndimage as ndi
+
+from app import core, assistant_model, canvas, pictures
+from app.core import CMAP, CODES, GRID
+
+VIEW = 800          # Minimum display pixels per side.
+STRIDE = 4          # Prediction stride; saving uses the full grid.
+MAP_H = 620         # Canvas height in pixels.
+UNDO = 30           # Maximum undo history length.
+
+PAINT = {n.replace("_", " "): c for c, n in CODES.items()}
+PAINT["erase"] = 0
+LAYERS = {"Prediction": ":material/auto_awesome: Prediction",
+          "Painting": ":material/brush: Painting",
+          "Confidence": ":material/equalizer: Confidence"}
+TOOLS = {"paint": ":material/gesture: Paint", "smart": ":material/format_color_fill: Smart fill"}
+CERTAINTY = {core.SURE: "Sure", core.MOSTLY: "Mostly", core.UNSURE: "Unsure"}
+# Render background layers in greyscale with layer-specific brightness legends.
+ESSENTIAL_BACKGROUNDS = ("hillshade", "nac", "zscene")
+BACKGROUNDS = {"hillshade": "Hillshade", "slope": "Slope", "rough": "Roughness",
+               "rel": "Relative height", "zscene": "Elevation", "svf": "Sky view",
+               "rel_local": "Local height", "curv": "Curvature", "svf_local": "Local sky view",
+               "psr": "Shadow (PSR)", "cpr": "Radar (CPR)", "nac": "NAC imagery"}
+LEGEND = {"slope": "Slope: bright is steep",
+          "rough": "Roughness: bright is rough",
+          "rel": "Relative height: bright is above its 4 km surroundings",
+          "zscene": "Elevation: bright is high",
+          "svf": "Sky view: dark is enclosed (crater floors), bright is open sky",
+          "rel_local": "Local height: dark is below its 150 m surroundings (small craters)",
+          "curv": "Curvature: bright is bowl-shaped, dark is ridge-like",
+          "svf_local": "Local sky view: dark is enclosed within 300 m (small craters)",
+          "psr": "Shadow: bright is permanently shadowed",
+          "cpr": "Radar CPR: bright is high",
+          "nac": "NAC imagery: display only; brightness is not terrain height or a PSR label"}
+
+
+def background_label(layer):
+    """Format a background label, highlighting model input features."""
+    label = BACKGROUNDS[layer] if layer in BACKGROUNDS else str(layer)
+    return f":blue[{label}]" if layer in assistant_model.schema()["features"] else label
+
+
+def chip(code, label, bold=None):
+    """Return an HTML unit swatch with an optional bold annotation."""
+    rgb = "#%02x%02x%02x" % CMAP[code][:3] if code else "transparent"
+    edge = "" if code else ";border:1px solid #888"
+    tail = f" &mdash; <b>{bold}</b>" if bold is not None else ""
+    return (f'<span style="display:inline-block;width:0.8em;height:0.8em;'
+            f'background:{rgb}{edge};border-radius:2px;margin-right:0.5em;'
+            f'vertical-align:-0.05em"></span>{label}{tail}')
+
+
+def data_stamp(dem_path):
+    """Return revisions for all terrain feature dependencies and companion files."""
+    order, _ = core._feature_plan(dem_path)
+    dependencies = {str(path) for path in core.manifest_files()}
+    dependencies.update(order)
+    for path in order:
+        for kind in ("psr", "cpr", "nac"):
+            companion = core.companion(path, kind)
+            if companion:
+                dependencies.add(companion)
+    stamps = []
+    for path in sorted(dependencies):
+        try:
+            stat = os.stat(path)
+            stamps.append((path, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino))
+        except FileNotFoundError:
+            stamps.append((path, None))
+    return (core.FEATURE_VERSION, tuple(stamps))
+
+
+@st.cache_data(show_spinner="Reading the DEM and building features (once per map)...",
+               max_entries=3)
+def load(dem_path, revision):
+    """Build terrain features and subsample the display and prediction grids."""
+    X, names, hs, prof, px = core.build(dem_path)
+    step = display_step(hs.shape)
+    return X, names, hs[::step, ::step], X[:, ::STRIDE, ::STRIDE], prof, px
+
+
+def display_step(shape):
+    """Choose a display stride that retains at least VIEW pixels per side."""
+    return max(1, min(shape) // VIEW)
+
+
+@st.cache_data(show_spinner=False, max_entries=3)
+def paintable_cells(valid):
+    """Identify painting cells containing valid DEM pixels."""
+    ids = core.per_pixel(np.arange(GRID * GRID).reshape(GRID, GRID), valid.shape)
+    return np.bincount(ids[valid], minlength=GRID * GRID).reshape(GRID, GRID) > 0
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def backdrop(dem_path, revision, layer, _X, _names, _hs):
+    """Return normalized brightness for the selected background layer.
+
+    Scale feature layers between their 2nd and 98th percentiles on this map.
+    """
+    if layer not in _names:
+        return _hs
+    step = display_step(_X.shape[1:])
+    v = _X[_names.index(layer), ::step, ::step]
+    good = np.isfinite(v)
+    if not good.any():
+        return np.zeros_like(_hs)
+    lo, hi = np.percentile(v[good], [2, 98])
+    if hi <= lo:                                   # Handle sparse binary layers.
+        lo, hi = v[good].min(), v[good].max()
+    return np.clip(np.where(good, (v - lo) / max(hi - lo, 1e-6), 0), 0, 1).astype(np.float32)
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def hatching(shape):
+    """Return solid, striped, and dotted pixel masks for confidence levels."""
+    i, j = np.indices(shape)
+    return {core.SURE: np.ones(shape, bool),
+            core.MOSTLY: (i + j) // 3 % 2 == 0,
+            core.UNSURE: (i % 4 < 2) & (j % 4 < 2)}
+
+
+def widen_stroke(m):
+    """Dilate sparse strokes while preserving filled loops."""
+    ys, xs = np.nonzero(m)
+    if ys.size == 0:
+        return m
+    bbox = (ys.max() - ys.min() + 1) * (xs.max() - xs.min() + 1)
+    return ndi.binary_dilation(m, iterations=1) if ys.size / bbox < 0.25 else m
+
+
+def run(fn, *a):
+    """Call a model operation and display expected errors in Streamlit."""
+    try:
+        return fn(*a)
+    except (NotImplementedError, ValueError, OSError) as e:
+        st.error(str(e))
+        st.stop()
+
+
+def flip():
+    """Toggle prediction and painting layers while preserving confidence display."""
+    alone = [layer for layer in ss.layers if layer != "Confidence"] == ["Prediction"]
+    ss.layers = (["Painting"] if alone else ["Prediction"]) + \
+        [layer for layer in ss.layers if layer == "Confidence"]
+
+
+ss = st.session_state
+ss.setdefault("layers", ["Painting"])
+ss.setdefault("tool", "paint")
+ss.setdefault("certainty", core.SURE)
+dems = all_dems = core.dem_files()
+catalog = {core.dem_name(r["working_dem"]): r for r in core.records()}
+
+
+def category(path):
+    """Return the dataset section for a DEM path."""
+    record = catalog.get(core.dem_name(path), {"working_dem": path})
+    return str(core.section(record))
+
+
+ss.pop("map_location", None)
+with st.sidebar:
+    st.subheader("1 · Map")
+    sections = ["All", *sorted({category(d) for d in dems})]
+    if ss.get("map_section") not in sections:
+        ss.map_section = "All"
+    selected = st.selectbox("Section", sections, key="map_section", width="stretch")
+    if selected != "All":
+        dems = [d for d in dems if category(d) == selected]
+
+if not dems:
+    st.subheader("No DEM found")
+    st.markdown(
+        "Install a prepared dataset under `data/processed_data/`, then reload this page. "
+        "Each top-level dataset folder is a Section. Nested DEMs, display layers and "
+        "bundled annotations are discovered through `working_dems.json`, not by "
+        "dropping rasters into arbitrary folders.")
+    st.stop()
+
+try:
+    model_name = core.backend().NAME
+except ModuleNotFoundError:
+    st.error(f'`core.MODEL` is `"{core.MODEL}"`, but there is no `model_{core.MODEL}.py` '
+             f'next to `core.py`. Pick one of: '
+             + ", ".join(f"`{m}`" for m in core.model_files()))
+    st.stop()
+
+model_stamp = assistant_model.artifact_stamp()
+assistant_changed = ("assistant" not in ss or
+                     ss.assistant.get("schema") != assistant_model.schema() or
+                     ss.get("assistant_stamp") != model_stamp)
+if assistant_changed:
+    ss.assistant = run(assistant_model.load)
+    ss.assistant_stamp = model_stamp
+    ss.pop("conf_for", None)
+
+
+def disk_files():
+    """Collect dataset and output file revisions for cache invalidation."""
+    outputs = {os.fspath(root) for root in (core.OUT_DIR, core.DRAFT_DIR, core.MAP_DIR,
+                                             core.LEGACY_OUT_DIR, core.LEGACY_DRAFT_DIR,
+                                             core.LEGACY_MIRRORED_DIR)}
+    found = {}
+    for root in (os.fspath(core.DEM_DIR), *outputs):
+        for directory, _, names in os.walk(root):
+            for n in names:
+                path = os.path.join(directory, n)
+                try:
+                    stat = os.stat(path)
+                    revision = (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino)
+                except FileNotFoundError:
+                    revision = None
+                found[path] = (revision, root in outputs)
+    return [(path, revision, output) for path, (revision, output) in sorted(found.items())]
+
+
+def disk_keys(files, maps):
+    """Separate map-specific output revisions from shared dataset revisions.
+
+    A map owns outputs whose directory or filename prefix matches its ID.
+    """
+    own, shared = {name: [] for name in maps}, []
+    for path, revision, output in files:
+        owners = set()
+        if output:
+            base = os.path.basename(path)
+            owners = {part for part in Path(path).parts[:-1] if part in own}
+            owners |= {base[:i] for i, ch in enumerate(base) if ch in "_." and base[:i] in own}
+        for name in owners:
+            own[name].append((path, revision))
+        if not owners:
+            shared.append((path, revision))
+    return {name: hash(tuple(v)) for name, v in own.items()}, hash(tuple(shared))
+
+
+@st.cache_resource
+def map_store():
+    """Return the shared cache of map values and their revision keys."""
+    return {}
+
+
+def per_map(what, name, key, compute):
+    """Compute a map value only when its revision key changes."""
+    store = map_store()
+    cached = store.get((what, name))
+    if cached is None or cached[0] != key:
+        store[(what, name)] = cached = (key, compute())
+    return cached[1]
+
+
+def map_status(name, key):
+    """Return display labels and training verification status for a map."""
+    def compute():
+        """Read annotation availability and verification metadata."""
+        verified = core.meta_get(name).get("verified")
+        labels = ["painted"] if core.load_painting(name).any() else []
+        return labels + ["verified"] * bool(verified), verified is True
+    return per_map("status", name, key, compute)
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def training_status(model_stamp, model_revision, maps, key, _bundle):
+    """Check for model changes using cached inputs from verified maps."""
+    return assistant_model.training_changed(_bundle, maps, lambda name, path: per_map(
+        "training", name, (map_keys[name], shared_key, path),
+        lambda: assistant_model.current_training_input(name, path)))
+
+
+all_maps = {core.dem_name(d): d for d in all_dems}
+map_keys, shared_key = disk_keys(disk_files(), all_maps)
+statuses = {n: map_status(n, (map_keys[n], shared_key)) for n in all_maps}
+# Only verified maps teach the model; painting any other map keeps this key.
+verified_training_maps = {n: d for n, d in all_maps.items() if statuses[n][1]}
+training_key = hash((shared_key, *((n, map_keys[n]) for n in verified_training_maps)))
+
+
+def marked(path):
+    """Format a map name with painting and verification status."""
+    n = core.dem_name(path)
+    labels = statuses[n][0]
+    return f"{n} — {', '.join(labels)}" if labels else n
+
+
+with st.sidebar:
+    if ss.get("selected_map") not in dems:
+        ss.selected_map = ss.get("dem") if ss.get("dem") in dems else dems[0]
+    dem = st.selectbox("Map", dems, format_func=marked,
+                       label_visibility="collapsed", key="selected_map")
+    if dem is None or dem not in dems:
+        st.info("Choose an installed map from the current Section.")
+        st.stop()
+
+    name = core.dem_name(dem)
+    record = catalog.get(name, {})
+    metadata = core.meta_get(name)
+    revision = (os.stat(dem).st_mtime_ns, os.stat(dem).st_size)
+    if (ss.get("dem"), ss.get("dem_revision"), ss.get("backend")) != (dem, revision, core.MODEL):
+        ss.dem, ss.cells, ss.pred, ss.hist = dem, None, None, []
+        ss.dem_revision = revision
+        ss.backend = core.MODEL
+
+feature_revision = run(data_stamp, dem)
+features_changed = ss.get("feature_revision") != feature_revision
+X, names, hs, Xs, prof, px = load(dem, feature_revision)
+shape = (prof["height"], prof["width"])
+cell_width, cell_height = shape[1] * px / GRID, shape[0] * px / GRID
+cell_size = (f"{cell_width:.0f}" if shape[0] == shape[1] else
+             f"{cell_width:.0f} × {cell_height:.0f}")
+tile_bounds = pictures.tile_bounds(name, shape, prof["transform"])
+terrain_valid = np.isfinite(X[names.index("zscene") if "zscene" in names else 0])
+valid_cells = paintable_cells(terrain_valid)
+
+if ss.get("cells") is None or not {"accepted", "confidence", "locked"} <= ss.keys():
+    ss.cells = core.load_painting(name)
+    ss.accepted = core.load_accepted(name)
+    ss.confidence = core.load_confidence(name)
+    ss.locked = bool(record.get("read_only"))
+    with st.spinner("Generating a starting map..."):
+        ss.pred = run(assistant_model.predict, ss.assistant, Xs, names)
+    ss.hist = []                     # Previous (cells, accepted, confidence) states.
+elif assistant_changed or features_changed:
+    ss.pred = run(assistant_model.predict, ss.assistant, Xs, names)
+ss.feature_revision = feature_revision
+if features_changed:
+    ss.pop("conf_for", None)
+
+assert ss.cells is not None
+# Provenance may be refreshed without changing a raster's revision.
+ss.locked = bool(record.get("read_only"))
+ss.accepted = ss.accepted & (ss.cells > 0)
+ss.confidence = np.where(ss.cells > 0, np.where(ss.confidence > 0, ss.confidence, core.SURE),
+                         0).astype(np.uint8)
+# Training weights reflect confidence; approved predictions receive half weight.
+# Smart fill preserves manual annotations in `hand`.
+hand = np.where(ss.accepted, 0, ss.cells).astype(np.uint8)
+sure = np.where(hand > 0, ss.confidence, 0).astype(np.uint8)
+suggested = (core.labels_to_cells(ss.pred) if ss.pred is not None
+             else np.zeros((GRID, GRID), np.uint8))
+fill = (ss.cells == 0) & (suggested > 0)
+pending = assistant_model.pending(ss.assistant, name, ss.cells, ss.confidence, ss.accepted)
+editable = not ss.locked
+has_painting = bool(np.any(ss.cells))
+saved_cells, saved_source = core.painting_source(name, final=True)
+saved_accepted = core.load_accepted(name, final=True)
+saved_confidence = core.load_confidence(name, final=True)
+can_restore = editable and saved_source is not None and any(
+    not np.array_equal(current, saved) for current, saved in zip(
+        (ss.cells, ss.accepted, ss.confidence), (saved_cells, saved_accepted, saved_confidence)))
+# Clearing existing labels must remain committable without a model or metadata.
+has_existing_labels = any(path and os.path.isfile(path) for path in (
+    core.painting_files(name, final=True, existing=True)[0],
+    core.output_file(name, "labels.tif", existing=True),
+    core.annotation_path(name, "painting"), core.annotation_path(name, "labels")))
+has_staged_metadata = os.path.isfile(core.output_file(name, "meta.json", final=False))
+is_verified = metadata.get("verified") is True
+training_changed = run(training_status, ss.assistant_stamp, ss.assistant["revision"],
+                       verified_training_maps, training_key, ss.assistant)
+can_update = bool(verified_training_maps or ss.assistant["samples"])
+can_save = editable and (has_painting or has_existing_labels or has_staged_metadata
+                         or ss.assistant["model"] is not None)
+smart_off = not editable or ss.pred is None
+if smart_off:
+    ss.tool = "paint"
+
+with st.sidebar:
+    st.subheader("2 · Paint as")
+    if ss.locked:
+        st.caption("This dataset marks the map read only. Painting, training updates and saving are disabled.")
+    tool = st.segmented_control(
+        "Tool", list(TOOLS), format_func=lambda value: TOOLS[value] if value in TOOLS else str(value),
+        key="tool", required=True, label_visibility="collapsed", disabled=smart_off,
+        help=("Smart fill needs an editable map and a prediction." if smart_off else
+              "Click to fill a predicted region; loop to limit the fill. Existing painting is kept."))
+    assert tool is not None
+    unit = st.radio("Paint as", list(PAINT), label_visibility="collapsed",
+                    disabled=not editable)
+    certainty = st.segmented_control(
+        "How sure", list(CERTAINTY),
+        format_func=lambda value: CERTAINTY[value] if value in CERTAINTY else str(value), key="certainty",
+        required=True, disabled=not editable,
+        help="Lower confidence reduces training weight. Mostly uses stripes; Unsure uses dots.")
+
+    with st.container(gap="xxsmall"):
+        st.subheader("3 · Painted")
+        st.html("".join(
+            f'<div style="margin:.12em 0">{chip(c, lbl, int((ss.cells == c).sum()))}</div>'
+            for lbl, c in PAINT.items() if c))
+    if ss.accepted.any():
+        st.caption(f"{int(ss.accepted.sum())} of these cells are approved predictions: they "
+                   "teach the model at half weight. Paint over one to correct it.")
+    levels = {core.CONFIDENCE[k][0]: int((sure == k).sum()) for k in core.CONFIDENCE}
+    if levels["mostly"] or levels["unsure"]:
+        st.caption("Training weights (defaults included): " + " · ".join(
+            f"{('full weight' if n == 'sure' else n)} {v}" for n, v in levels.items()) + " cells.")
+    accept = st.button(
+        "Approve prediction", icon=":material/done_all:", width="stretch",
+        disabled=not editable or not fill.any(),
+        help=("This map is read only." if ss.locked else
+              "Fill unpainted cells with the prediction. Undo is available."))
+    row = st.container(horizontal=True)
+    undo = row.button("Undo", icon=":material/undo:", width="stretch",
+                      disabled=not editable or not ss.hist)
+    clear = row.button("Clear", icon=":material/delete:", width="stretch",
+                       disabled=not editable or not has_painting)
+    restore = st.button(
+        "Restore saved", icon=":material/restore:", width="stretch", disabled=not can_restore,
+        help="Replace your draft with the saved painting. Undo is available.")
+
+    st.subheader("4 · Update Model")
+    update_help = (("New verified edits." if training_changed else "Model up to date.") +
+                   " Retrain from all verified paintings." if can_update else
+                   "Verify a painted map to enable training.")
+    update_color = "yellow" if training_changed else "green"
+    update = st.button(f":{update_color}[Update model]", key="update_model",
+                       icon=":material/refresh:", width="stretch", disabled=not can_update,
+                       help=update_help)
+    st.subheader("5 · Finish")
+    verified = st.checkbox("Verified",
+                           value=bool(metadata.get("verified", False)),
+                           key=f"verified_{name}", disabled=not editable,
+                           help="Use this map for training. Save to commit.")
+    if editable and verified != bool(metadata.get("verified", False)):
+        core.meta_set(name, final=False, verified=verified)
+        st.rerun()
+    save = st.button("Save labels + map", icon=":material/save:",
+                     width="stretch", type="primary", disabled=not can_save)
+    alpha = st.slider("Colour strength", 0.0, 1.0, 0.25, 0.05)
+
+
+def step(cells, accepted, confidence):
+    """Save an editable painting change and retain the previous state for undo."""
+    if not editable or all(np.array_equal(before, after) for before, after in
+                           zip((ss.cells, ss.accepted, ss.confidence),
+                               (cells, accepted, confidence))):
+        return
+    ss.hist = (ss.hist + [(ss.cells.copy(), ss.accepted.copy(), ss.confidence.copy())])[-UNDO:]
+    ss.cells, ss.accepted, ss.confidence = cells, accepted, confidence
+    core.save_painting(name, ss.cells, accepted=ss.accepted,
+                       confidence=ss.confidence)
+
+
+def sure_of(where):
+    """Apply the selected confidence level to the supplied cell mask."""
+    assert certainty is not None
+    return np.where(where, certainty, ss.confidence).astype(np.uint8)
+
+
+if undo and editable and ss.hist:
+    ss.cells, ss.accepted, ss.confidence = ss.hist.pop()
+    core.save_painting(name, ss.cells, accepted=ss.accepted, confidence=ss.confidence)
+    st.rerun()
+if clear and editable and has_painting:
+    step(np.zeros((GRID, GRID), np.uint8), np.zeros((GRID, GRID), bool),
+         np.zeros((GRID, GRID), np.uint8))
+    st.rerun()
+if restore and can_restore:
+    step(saved_cells, saved_accepted, saved_confidence)
+    st.rerun()
+if accept and editable and fill.any():
+    step(np.where(fill, suggested, ss.cells).astype(np.uint8), ss.accepted | fill,
+         sure_of(fill))
+    st.rerun()
+if update and can_update:
+    with st.spinner("Training from all verified maps..."):
+        message = st.empty()
+        result = run(assistant_model.retrain, message.text)
+    ss.assistant = result
+    ss.assistant_stamp = assistant_model.artifact_stamp()
+    ss.pred = run(assistant_model.predict, result, Xs, names)
+    if ss.pred is not None:
+        ss.layers = ["Prediction"] + [layer for layer in ss.layers if layer == "Confidence"]
+    ss.pop("conf_for", None)
+    st.rerun()
+
+st.markdown(
+    f'<div style="font-size:1.35rem;font-weight:600;line-height:1.3">'
+    f'{name} — painting {chip(PAINT[unit], f"<b>{unit}</b>")}</div>'
+    f'<div style="font-size:.85rem;opacity:.6;margin:.1em 0 .3em">'
+    + (f"Smart fill: click a region to paint the model's outline of it as {unit}, or loop "
+       f"an area to take only its {unit}. " if tool == "smart" else
+       "Loop to fill, drag to paint a band, click for one cell. ") +
+    f'Scroll to zoom, right-drag to pan, hold Space to hide the colours. '
+    f"{model_name} · {px:.3g} m pixels · {cell_size} m cells"
+    f'</div>', unsafe_allow_html=True)
+
+
+available_backgrounds = ["hillshade", *names]
+
+primary_backgrounds = dict.fromkeys([*ESSENTIAL_BACKGROUNDS, *assistant_model.schema()["features"]])
+backgrounds = [layer for layer in primary_backgrounds if layer in available_backgrounds]
+backgrounds += [layer for layer in available_backgrounds if layer not in backgrounds]
+# Fall back only when a view is unavailable on this map.
+selected_background = ss.get("background")
+ss.background = selected_background if selected_background in backgrounds else "hillshade"
+with st.container(horizontal=True, vertical_alignment="center"):
+    shown = st.pills("Show", list(LAYERS), selection_mode="multi",
+                     format_func=lambda value: LAYERS[value] if value in LAYERS else str(value),
+                     key="layers", label_visibility="collapsed",
+                     help="Model confidence: black means low or missing; white means high.")
+    confident = "Confidence" in shown and ss.pred is not None
+    st.button("Flip", icon=":material/swap_horiz:", on_click=flip, shortcut="F",
+              help="Switch between prediction and painting.")
+background_help = ("Turn Confidence off to choose a background." if confident else
+                   "Brightness is scaled separately for each map.")
+background = st.segmented_control(
+    "Background", backgrounds, format_func=background_label,
+    key="background", required=True, label_visibility="collapsed",
+    width="stretch", wrap=True, disabled=confident, help=background_help)
+assert background is not None
+st.caption(":blue[Training inputs] · other layers are viewing-only.")
+
+if confident:
+    if ss.get("conf_for") != (name, ss.assistant["revision"], feature_revision):
+        with st.spinner("Computing model confidence for every pixel..."):
+            ss.conf = run(assistant_model.confidence, ss.assistant, Xs, names)
+        ss.conf_for = (name, ss.assistant["revision"], feature_revision)
+    base = pictures.confidence_base(ss.conf, hs.shape)
+    legend = "Model score: black is low or missing confidence, white is high; not certainty of correctness"
+    peek = "Model confidence, no colours"
+else:
+    base = backdrop(dem, feature_revision, background, X, names, hs)
+    legend = LEGEND.get(background, "")
+    peek = f"{BACKGROUNDS.get(background, background)}, no colours"
+if {"Prediction", "Painting"}.issubset(shown) and ss.pred is not None:
+    img = pictures.disagreement(base, ss.pred, ss.cells, alpha)
+    legend = "Yellow: disagreement" + (f" · {legend}" if legend else "")
+else:
+    painting = []
+    if "Painting" in shown:
+        for level, drawn in hatching(base.shape).items():
+            codes = core.cells_to_labels(np.where(ss.confidence == level, ss.cells, 0), base.shape)
+            codes[~drawn] = 0
+            painting.append((codes, alpha))
+    img = pictures.render(base, [(ss.pred if "Prediction" in shown else None, alpha), *painting])
+missing = ~terrain_valid[::display_step(shape), ::display_step(shape)]
+if not confident and background in names:
+    missing |= ~np.isfinite(X[names.index(background), ::display_step(shape), ::display_step(shape)])
+img = pictures.tile_frame(img, tile_bounds, missing=missing)
+bare = pictures.tile_frame(pictures.terrain(base), tile_bounds, missing=missing)
+stroke = canvas.map_canvas(img, terrain=bare, grid=GRID, height=MAP_H,
+                           bounds=tile_bounds, valid_cells=valid_cells,
+                           legend=legend, peek=peek,
+                           tool="locked" if not editable else tool, key=f"canvas_{name}")
+if stroke:
+    cells = [c for c in stroke["cells"] if 0 <= c < GRID * GRID and valid_cells.flat[c]]
+    stroke = dict(stroke, cells=cells) if cells else None
+
+# Deduplicate stroke events across Streamlit reruns.
+if stroke and stroke.get("id") != ss.get("last_stroke") and not editable:
+    ss.last_stroke = stroke["id"]
+    st.toast("This map is not editable.")
+elif stroke and stroke.get("id") != ss.get("last_stroke"):
+    ss.last_stroke = stroke["id"]
+    hit = np.zeros(GRID * GRID, bool)
+    hit[np.asarray(stroke["cells"], int)] = True
+    hit = np.asarray(widen_stroke(hit.reshape(GRID, GRID)), dtype=bool)
+    hit &= valid_cells
+    code = PAINT[unit]
+    if tool == "smart" and code:
+        seed = divmod(int(stroke["cells"][0]), GRID)
+        region = (core.smart_fill(suggested, seed=seed) if stroke.get("click") else
+                  core.smart_fill(suggested, inside=hit, unit=code))
+        region &= (hand == 0) & valid_cells      # Preserve manual labels and NoData.
+        if region.any():
+            # Agreement retains prediction provenance; relabeling is a manual correction.
+            step(np.where(region, code, ss.cells).astype(np.uint8),
+                 (ss.accepted & ~region) | (region & (suggested == code)), sure_of(region))
+            st.rerun()
+        elif not stroke.get("click"):
+            st.toast(f"The model predicts no unpainted {unit} in that area.")
+        elif suggested[seed] == 0:
+            st.toast("There is no prediction at that spot.")
+        else:
+            st.toast("That region is already painted by hand.")
+    else:
+        # Painting over an approved prediction converts it to a manual annotation.
+        step(np.where(hit, code, ss.cells).astype(np.uint8), ss.accepted & ~hit,
+             sure_of(hit) if code else np.where(hit, 0, ss.confidence).astype(np.uint8))
+        st.rerun()
+
+if save and can_save:
+    labels_path = core.output_file(name, "labels.tif")
+    prediction_path = core.output_file(name, "map.tif")
+    accepted_path = core.output_file(name, "accepted.npy")
+    valid = np.isfinite(X[0])
+    lab = core.cells_to_labels(ss.cells, shape, valid=valid)
+    full_prediction = None
+    if ss.assistant["model"] is not None:
+        with st.spinner("Predicting over the whole map..."):
+            full_prediction = run(assistant_model.predict, ss.assistant, X, names)
+    core.write_map(labels_path, lab, prof)
+    core.save_painting(name, ss.cells, final=True, accepted=ss.accepted,
+                       confidence=ss.confidence)
+    if full_prediction is not None:
+        core.write_map(prediction_path, full_prediction, prof)
+    elif os.path.exists(prediction_path):
+        os.remove(prediction_path)            # Remove obsolete predictions on save.
+    areas = {CODES[c]: round(float((lab == c).sum()) * px * px / 1e6, 3) for c in CODES}
+    thumb = pictures.blacken(pictures.render(hs, [(ss.pred, 0.6), (ss.cells, 0.6)]),
+                             ~terrain_valid)
+    thumb.thumbnail((360, 360))
+    thumb.save(core.output_file(name, "thumb.png"))
+    core.meta_set(name, verified=bool(verified), dem=dem, inputs=names, model=core.MODEL,
+                  model_schema=ss.assistant["schema"],
+                  site_id=core.site_id(dem),
+                  model_revision=ss.assistant["revision"],
+                  prediction_saved=full_prediction is not None,
+                  corrections_pending_update=bool(pending),
+                  saved_at=datetime.datetime.now().isoformat(timespec="seconds"),
+                  cells={CODES[c]: int((ss.cells == c).sum()) for c in CODES},
+                  cells_accepted={CODES[c]: int(((ss.cells == c) & ss.accepted).sum())
+                                  for c in CODES},
+                  cells_by_confidence={core.CONFIDENCE[k][0]: int((sure == k).sum())
+                                       for k in core.CONFIDENCE},
+                  painted_area_km2=areas,
+                  painted_frac=round(float((lab != 255).sum()) / max(1, int(valid.sum())), 4))
+    st.success(("Saved and marked **verified**" if verified else "Saved") +
+               f" — `{labels_path}` (your painting"
+               + (f", with accepted predictions marked in `{os.path.basename(accepted_path)}`)"
+                  if ss.accepted.any() else ")") +
+               (f" and `{prediction_path}` (the prediction)" if full_prediction is not None else
+                ". A prediction can be saved after training the first model."))

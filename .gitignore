@@ -1,0 +1,30 @@
+# Local source data.
+/data/raw_data/*
+!/data/raw_data/.gitkeep
+/data/reference_data/
+/data/processed_data/
+/output/
+/models/
+
+# Local backups and reports.
+/reports/
+/poster/
+*.log
+*.tmp
+*.aux.xml
+.dataset.lock
+.prepare.lock
+.streamlit/secrets.toml
+
+# Environments, caches, and editor files.
+.venv*/
+.uv-cache/
+.agents/
+.claude/
+.codex/
+__pycache__/
+*.pyc
+.pytest_cache/
+.selenograph-json-*
+.DS_Store
+._*
