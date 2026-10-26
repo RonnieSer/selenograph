@@ -1,7 +1,6 @@
 # Selenograph
 
-Thesis research code by Veronica Serrano for mapping lunar geological units
-with a Random Forest assistant.
+Thesis research code by Veronica Serrano for: ""
 
 ## Start
 
@@ -20,8 +19,7 @@ On Windows, use `python` instead of `python3` and activate with
 `.venv\Scripts\Activate.ps1` in PowerShell.
 
 Use **Paint** to label maps, **Gallery** to browse them, and **Progress** to evaluate
-predictions. Prepare your maps using the [data setup guide](data/sources.md).
-See [dataset details](docs/DATASET.md) and [training notes](docs/TRAINING.md).
+predictions.
 
 Run tests with `python -B -m unittest discover -s tests -q`.
 
