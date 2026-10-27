@@ -31,15 +31,20 @@ button {
 
 JS = """
 // Views live on the page, keyed by map, so a redraw or remount keeps your zoom.
-const MAPS = (globalThis.__selenographMaps ??= new Map())
+if (!globalThis.__selenographMaps) {
+  globalThis.__selenographMaps = new Map()
+}
+const MAPS = globalThis.__selenographMaps
 
-function inside(x, y, p) {
-  let c = false
-  for (let a = 0, b = p.length - 1; a < p.length; b = a++) {
-    const [xa, ya] = p[a], [xb, yb] = p[b]
-    if ((ya > y) !== (yb > y) && x < ((xb - xa) * (y - ya)) / (yb - ya) + xa) c = !c
+function inside(x, y, polygon) {
+  let contained = false
+  for (let a = 0, b = polygon.length - 1; a < polygon.length; b = a++) {
+    const [xa, ya] = polygon[a], [xb, yb] = polygon[b]
+    if ((ya > y) !== (yb > y) && x < ((xb - xa) * (y - ya)) / (yb - ya) + xa) {
+      contained = !contained
+    }
   }
-  return c
+  return contained
 }
 
 // Cells the stroke passes over, plus every cell whose centre it loops around.
@@ -52,25 +57,24 @@ export function selectCells(path, grid, width, height, bounds = [0, 0, 1, 1], va
   // a clipped tile. The same stroke must select the same original painting cells.
   const snap = (v) => Math.abs(v - Math.round(v)) < 1e-9 ? Math.round(v) : v
   path = path.map(([x, y]) => [snap((x - ox) / cellWidth), snap((y - oy) / cellHeight)])
-  const cw = 1, ch = 1
   const hit = new Set()
   const add = (x, y) => {
-    const i = Math.floor(y / ch), j = Math.floor(x / cw)
+    const i = Math.floor(y), j = Math.floor(x)
     if (i >= 0 && j >= 0 && i < grid && j < grid) hit.add(i * grid + j)
   }
   add(...path[0])
   for (let n = 1; n < path.length; n++) {
     const [x0, y0] = path[n - 1], [x1, y1] = path[n]
-    const steps = Math.ceil(Math.hypot((x1 - x0) / cw, (y1 - y0) / ch) * 3)
+    const steps = Math.ceil(Math.hypot(x1 - x0, y1 - y0) * 3)
     for (let t = 1; t <= steps; t++) add(x0 + ((x1 - x0) * t) / steps, y0 + ((y1 - y0) * t) / steps)
   }
   if (path.length > 2) {
     const xs = path.map((p) => p[0]), ys = path.map((p) => p[1])
-    const j0 = Math.max(0, Math.floor(Math.min(...xs) / cw)), j1 = Math.min(grid - 1, Math.floor(Math.max(...xs) / cw))
-    const i0 = Math.max(0, Math.floor(Math.min(...ys) / ch)), i1 = Math.min(grid - 1, Math.floor(Math.max(...ys) / ch))
+    const j0 = Math.max(0, Math.floor(Math.min(...xs))), j1 = Math.min(grid - 1, Math.floor(Math.max(...xs)))
+    const i0 = Math.max(0, Math.floor(Math.min(...ys))), i1 = Math.min(grid - 1, Math.floor(Math.max(...ys)))
     for (let i = i0; i <= i1; i++)
       for (let j = j0; j <= j1; j++)
-        if (inside((j + 0.5) * cw, (i + 0.5) * ch, path)) hit.add(i * grid + j)
+        if (inside(j + 0.5, i + 0.5, path)) hit.add(i * grid + j)
   }
   return Array.from(hit).filter((id) => allowed === null || allowed.has(id)).sort((a, b) => a - b)
 }
@@ -88,8 +92,11 @@ export default function (component) {
   canvas.classList.toggle("locked", data.tool === "locked")
   const viewKey = `${data.map}:${JSON.stringify(data.bounds)}`
   let s = MAPS.get(viewKey)
-  if (!s) MAPS.set(viewKey, (s = { img: null, src: null, bare: null, bareSrc: null,
-                                     view: null, lasso: null, pan: null, peek: false }))
+  if (!s) {
+    s = { img: null, src: null, bare: null, bareSrc: null,
+          view: null, lasso: null, pan: null, peek: false }
+    MAPS.set(viewKey, s)
+  }
 
   function size() {
     const r = canvas.getBoundingClientRect()
@@ -119,7 +126,10 @@ export default function (component) {
     if (data.legend) tag(data.legend, 8, h - 30)
     if (s.lasso && s.lasso.length > 1) {
       ctx.beginPath()
-      s.lasso.forEach(([x, y], n) => (n ? ctx.lineTo : ctx.moveTo).call(ctx, v.x + x * v.k, v.y + y * v.k))
+      s.lasso.forEach(([x, y], index) => {
+        if (index === 0) ctx.moveTo(v.x + x * v.k, v.y + y * v.k)
+        else ctx.lineTo(v.x + x * v.k, v.y + y * v.k)
+      })
       ctx.lineJoin = "round"
       ctx.lineWidth = 4; ctx.strokeStyle = "rgba(0, 0, 0, 0.55)"; ctx.stroke()
       ctx.lineWidth = 2; ctx.strokeStyle = "#fff"; ctx.stroke()
@@ -171,9 +181,11 @@ export default function (component) {
     blur: () => peek(false),
   }
   // Capture phase on the window, so a focused widget cannot swallow the key first.
-  const listen = (set, on) => {
-    for (const [type, fn] of Object.entries(set ?? {}))
-      window[on ? "addEventListener" : "removeEventListener"](type, fn, true)
+  const listen = (listeners, on) => {
+    for (const [type, handler] of Object.entries(listeners ?? {})) {
+      if (on) window.addEventListener(type, handler, true)
+      else window.removeEventListener(type, handler, true)
+    }
   }
   listen(s.keys, false)                          // the previous render's listeners
   listen((s.keys = keys), true)
@@ -261,11 +273,11 @@ def png(image):
     """Encode an image as a PNG data URL, caching recent images by pixel hash."""
     key = (image.mode, image.size, hashlib.blake2b(image.tobytes(), digest_size=16).digest())
     if key not in _ENCODED:
-        buf = io.BytesIO()
-        image.save(buf, format="PNG")
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
         while len(_ENCODED) >= 8:
             _ENCODED.pop(next(iter(_ENCODED)))
-        _ENCODED[key] = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+        _ENCODED[key] = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
     return _ENCODED[key]
 
 

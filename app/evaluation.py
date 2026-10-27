@@ -11,7 +11,6 @@ import re
 import uuid
 from pathlib import Path
 from time import perf_counter
-from typing import Any, cast
 
 import numpy as np
 import rasterio
@@ -101,7 +100,12 @@ def _painting(name):
     if confidence.shape != cells.shape or accepted.shape != cells.shape:
         raise ValueError(f"Invalid painting flags: {name}")
     sure = np.isin(cells, CLASSES) & (confidence == core.SURE) & ~accepted.astype(bool)
-    snapshot = "saved" if final is True else "draft" if final is False else "none"
+    if final is True:
+        snapshot = "saved"
+    elif final is False:
+        snapshot = "draft"
+    else:
+        snapshot = "none"
     if bundled:
         provenance = ((core.map_record(name) or {}).get("annotations") or {}).get("provenance")
         declared = provenance.get("snapshot") if isinstance(provenance, dict) else None
@@ -143,8 +147,8 @@ def catalog():
             "group": str(group), "geography_aliases": record.get("geography_aliases", []),
             "source_kind": record.get("source_kind", "processed_map"), "section": section,
             "path": str(path), "snapshot": snapshot, "grid": record.get("grid"),
-            "label_source": metadata.get("label_source") or annotations.get("label_source") or record.get("label_source") or (
-                f"{snapshot} cell labels; sure cells excluding accepted predictions" if cells.any() else None),
+            "label_source": metadata.get("label_source") or annotations.get("label_source") or record.get("label_source") or
+                            f"{snapshot} cell labels; sure cells excluding accepted predictions",
             "painted": True, "verified": verified, "available": reason is None, "reason": reason,
             "label_status": metadata.get("label_status") or annotations.get("label_status") or
                             record.get("label_status") or "user verification flag; label independence not established",
@@ -175,7 +179,7 @@ def _training_labels(samples):
     return np.concatenate(values) if values else np.empty(0, np.uint8)
 
 
-def _plan(bundle, names, registry, aliases):
+def _plan(bundle, names, registry):
     """Plan one fold per selected map using the remaining verified samples."""
     samples = bundle.get("samples", {})
     verified = assistant.verified_samples(samples)
@@ -200,8 +204,8 @@ def _plan(bundle, names, registry, aliases):
 @core.catalog_snapshot()
 def plan(bundle, names):
     """Plan evaluation folds without extracting terrain features or fitting models."""
-    registry, aliases = _coalesce_groups(catalog(), bundle.get("samples", {}))
-    return _plan(bundle, names, registry, aliases)
+    registry, _ = _coalesce_groups(catalog(), bundle.get("samples", {}))
+    return _plan(bundle, names, registry)
 
 
 def _cell_ids(shape):
@@ -231,33 +235,33 @@ def cell_majority(prediction, valid=None):
 
 def _load_map(meta):
     """Build terrain features and determine eligible manual evaluation cells."""
-    stack, names, shade, profile, px = core.build(meta["path"])
-    profile = cast(dict[str, Any], profile)
-    X = assistant.features(stack, names).astype(np.float32, copy=True)
-    grid = data._Grid(X.shape[1:], profile["transform"], profile["crs"])
-    # Feature-source coverage can be smaller than the target DEM footprint. Keep
-    # its native terrain/labels for coverage denominators and complete label panels.
-    z, transform, crs, _ = core.read(meta["path"], core.MAX_SIDE)
-    if data._Grid(z.shape, transform, crs) != grid:
+    stack, names, shade, profile, pixel_size = core.build(meta["path"])
+    features = assistant.features(stack, names).astype(np.float32, copy=True)
+    grid = data._Grid(features.shape[1:], profile["transform"], profile["crs"])
+    # Measure coverage against the full DEM, even when features cover less terrain.
+    elevation, transform, crs, _ = core.read(meta["path"], core.MAX_SIDE)
+    if data._Grid(elevation.shape, transform, crs) != grid:
         raise ValueError(f"Feature grid differs from the target DEM: {meta['name']}")
-    terrain = np.isfinite(z)
-    valid = terrain & np.isfinite(X).all(axis=0)
+    terrain = np.isfinite(elevation)
+    valid = terrain & np.isfinite(features).all(axis=0)
     cells, manual, snapshot = _painting(meta["name"])
     reference = core.cells_to_labels(cells, grid.shape, terrain)
-    ground, area = cell_sum(terrain), cell_sum(np.ones(grid.shape, bool))
-    finite = cell_sum(valid)
-    known = cell_sum(valid & np.isin(reference, CLASSES))
-    eligible = (manual & (area > 0) & (ground >= data.MIN_COVERAGE * area) & (ground > 0)
-                & (finite >= data.MIN_COVERAGE * ground) & (known >= data.MIN_COVERAGE * ground))
-    X[:, ~valid] = np.nan
+    terrain_counts, cell_pixels = cell_sum(terrain), cell_sum(np.ones(grid.shape, bool))
+    finite_counts = cell_sum(valid)
+    label_counts = cell_sum(valid & np.isin(reference, CLASSES))
+    eligible = (manual & (cell_pixels > 0) & (terrain_counts > 0)
+                & (terrain_counts >= data.MIN_COVERAGE * cell_pixels)
+                & (finite_counts >= data.MIN_COVERAGE * terrain_counts)
+                & (label_counts >= data.MIN_COVERAGE * terrain_counts))
+    features[:, ~valid] = np.nan
     return {
         "tile_id": meta["name"], "map_id": meta["map_id"], "site_id": meta["site_id"],
-        "group": meta["group"], "snapshot": snapshot, "grid": grid.metadata(), "px_m": float(px),
-        "X": X, "hillshade": np.asarray(shade, np.float32), "reference": reference,
+        "group": meta["group"], "snapshot": snapshot, "grid": grid.metadata(), "px_m": float(pixel_size),
+        "X": features, "hillshade": np.asarray(shade, np.float32), "reference": reference,
         "cells": cells, "eligible": eligible, "valid": valid, "support": np.zeros(grid.shape, bool),
         "reference_terrain_pixels": int(terrain.sum()),
         "public_coverage_fraction": float(valid.sum() / terrain.sum()) if terrain.any() else 0.0,
-        "exclusions": {"no_pixel_cells": int((area == 0).sum()),
+        "exclusions": {"no_pixel_cells": int((cell_pixels == 0).sum()),
                        "not_sure_manual_cells": int((~manual).sum()),
                        "insufficient_coverage": int((manual & ~eligible).sum())},
     }
@@ -283,7 +287,6 @@ def _load_tiles(names, registry, progress):
     return tiles, skipped, provenance
 
 
-
 @core.catalog_snapshot()
 def run(bundle, names, progress=None, output_root=None, model_root=None, poster_root=None):
     """Evaluate selected maps and return the JSON report path and report.
@@ -299,18 +302,21 @@ def run(bundle, names, progress=None, output_root=None, model_root=None, poster_
         raise ValueError("Assistant schema differs from the current feature/backend schema")
     selected = list(dict.fromkeys(names))
     registry, aliases = _coalesce_groups(catalog(), bundle.get("samples", {}))
-    plans = _plan(bundle, selected, registry, aliases)
+    plans = _plan(bundle, selected, registry)
     if not any(p["reason"] is None for p in plans):
         detail = "; ".join(f"{p['group']}: {p['reason']}" for p in plans) or "No maps selected"
         raise ValueError("No evaluable folds: " + detail)
-    skipped = []
+    skipped, wanted = [], []
     for fold in plans:
         for name in fold["maps"]:
-            reason = registry.get(name, {}).get("reason") or ("Map is not in the current catalog" if name not in registry else None)
-            reason = reason or fold["reason"]
+            if name not in registry:
+                reason = "Map is not in the current catalog"
+            else:
+                reason = registry[name].get("reason") or fold["reason"]
             if reason:
                 skipped.append({"name": name, "group": fold["group"], "reason": reason})
-    wanted = [n for p in plans if p["reason"] is None for n in p["maps"] if registry.get(n, {}).get("available")]
+            if fold["reason"] is None and registry.get(name, {}).get("available"):
+                wanted.append(name)
     with rasterio.Env(GDAL_PAM_ENABLED="NO", PROJ_NETWORK="OFF"):
         tiles, extraction_skips, provenance = _load_tiles(wanted, registry, progress)
     skipped.extend(extraction_skips)
@@ -388,6 +394,15 @@ def run(bundle, names, progress=None, output_root=None, model_root=None, poster_
         base_aggregate += baseline_matrix
     if not folds:
         raise ValueError("No fold could be fitted; active model unchanged, no latest report published")
+    tile_reports = []
+    fields = ("tile_id", "map_id", "site_id", "group", "snapshot", "grid", "px_m",
+              "source_kind", "label_source", "label_status", "verified", "section",
+              "reference_terrain_pixels", "public_coverage_fraction", "exclusions", "metrics")
+    for tile in scored:
+        entry = {key: tile[key] for key in fields}
+        entry.update(eligible_cells=int(tile["eligible"].sum()),
+                     source_label=tile["label_source"], review_status=tile["label_status"])
+        tile_reports.append(entry)
     report = {
         "run_id": run_id, "created_at": now.isoformat(), "schema": json.loads(json.dumps(assistant.schema())),
         "feature_names": list(core.BASE_FEATS), "model_revision": bundle.get("revision"),
@@ -400,11 +415,7 @@ def run(bundle, names, progress=None, output_root=None, model_root=None, poster_
         "validation": {"method": "independent selected-map evaluation", "aggregate": report_helpers._metrics(aggregate),
                        "map_mean_macro_f1": float(np.mean([f["metrics"]["macro_f1"] for f in folds])),
                        "baseline_aggregate": report_helpers._metrics(base_aggregate), "folds": folds},
-        "tiles": [{**{k: t[k] for k in ("tile_id", "map_id", "site_id", "group", "snapshot", "grid", "px_m",
-                                       "source_kind", "label_source", "label_status", "verified", "section", "reference_terrain_pixels",
-                                       "public_coverage_fraction", "exclusions", "metrics")},
-                   "eligible_cells": int(t["eligible"].sum()),
-                   "source_label": t["label_source"], "review_status": t["label_status"]} for t in scored],
+        "tiles": tile_reports,
         "selected_maps": selected, "skipped": skipped, "plan": plans,
         "software_versions": report_helpers._software_versions(),
         "policies": {

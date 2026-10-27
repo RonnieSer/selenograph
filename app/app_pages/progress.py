@@ -49,7 +49,8 @@ except ModuleNotFoundError as error:
         raise
     st.caption("The evaluation engine is not available yet.")
 
-maps, folds = {}, []
+maps = {}
+folds = []
 if evaluation is not None:
     maps = {name: meta for name, meta in evaluation.catalog().items()
             if meta.get("painted", bool(meta.get("label_source")))}
@@ -86,11 +87,14 @@ elif names and not ready:
     st.info("No evaluation is ready. See the evaluation plan for details.")
 if names:
     with st.expander("Evaluation plan", expanded=not bool(ready)):
-        st.dataframe([{"Map": ", ".join(f.get("maps", [])),
-                       "Training maps": len(f.get("train_keys", [])),
-                       "Left out": ", ".join(f.get("maps", [])) if f.get("mode") == "leave-one-map-out" else "None",
-                       "Status": f.get("reason") or "Ready"} for f in folds],
-                     hide_index=True, width="stretch")
+        plan_rows = []
+        for fold in folds:
+            map_names = ", ".join(fold.get("maps", []))
+            left_out = map_names if fold.get("mode") == "leave-one-map-out" else "None"
+            plan_rows.append({"Map": map_names,
+                              "Training maps": len(fold.get("train_keys", [])),
+                              "Left out": left_out, "Status": fold.get("reason") or "Ready"})
+        st.dataframe(plan_rows, hide_index=True, width="stretch")
 if st.button("Evaluate", icon=":material/fact_check:", type="primary", disabled=not can_evaluate,
              width="stretch") and can_evaluate and evaluation is not None:
     try:
@@ -120,19 +124,24 @@ else:
         st.metric("Scored cells", aggregate.get("n", 0), border=True)
     results = validation.get("folds", [])
     if results:
-        st.dataframe([{"Map": ", ".join(f.get("maps", f.get("test_tiles", []))),
-                       "Training maps": len(f.get("train_keys", f.get("train_tiles", []))),
-                       "Scored cells": (f.get("metrics") or {}).get("n"),
-                       "Accuracy": (f.get("metrics") or {}).get("accuracy"),
-                       "Macro F1": (f.get("metrics") or {}).get("macro_f1"),
-                       "Baseline accuracy": (f.get("baseline") or {}).get("accuracy"),
-                       "Baseline macro F1": (f.get("baseline") or {}).get("macro_f1")}
-                      for f in results], hide_index=True, width="stretch")
-        bars = [{"Map": ", ".join(f.get("maps", f.get("test_tiles", []))) or f["group"],
-                 "Method": method, "Macro F1": scores["macro_f1"]}
-                for f in results for method, scores in (("Evaluation model", f.get("metrics") or {}),
-                                                       ("Majority baseline", f.get("baseline") or {}))
-                if scores.get("macro_f1") is not None]
+        result_rows = []
+        bars = []
+        for fold in results:
+            map_names = ", ".join(fold.get("maps", fold.get("test_tiles", [])))
+            scores = fold.get("metrics") or {}
+            baseline_scores = fold.get("baseline") or {}
+            result_rows.append({
+                "Map": map_names,
+                "Training maps": len(fold.get("train_keys", fold.get("train_tiles", []))),
+                "Scored cells": scores.get("n"),
+                "Accuracy": scores.get("accuracy"), "Macro F1": scores.get("macro_f1"),
+                "Baseline accuracy": baseline_scores.get("accuracy"),
+                "Baseline macro F1": baseline_scores.get("macro_f1")})
+            for method, metrics in (("Evaluation model", scores), ("Majority baseline", baseline_scores)):
+                if metrics.get("macro_f1") is not None:
+                    bars.append({"Map": map_names or fold["group"],
+                                 "Method": method, "Macro F1": metrics["macro_f1"]})
+        st.dataframe(result_rows, hide_index=True, width="stretch")
         if bars:
             st.bar_chart(pd.DataFrame(bars), x="Map", y="Macro F1", color="Method",
                          stack=False, width="stretch")
@@ -140,8 +149,9 @@ else:
         st.caption("Reference painting cells are coarse labels, not independent 5 m truth. "
                    "Class 3 includes crater interiors / floor, not measured permanent shadow or ice.")
         scopes = {"All selected maps": aggregate, "Majority baseline": baseline}
-        scopes.update({", ".join(f.get("maps", f.get("test_tiles", []))) or str(f["group"]):
-                       f.get("metrics") or {} for f in results})
+        for fold in results:
+            map_names = ", ".join(fold.get("maps", fold.get("test_tiles", [])))
+            scopes[map_names or str(fold["group"])] = fold.get("metrics") or {}
         scope = st.selectbox("Score detail", list(scopes), key="evaluation_score_detail", width="stretch")
         metrics = scopes[scope]
         if metrics.get("per_class"):
@@ -149,10 +159,13 @@ else:
                          hide_index=True, width="stretch")
         if metrics.get("confusion_matrix") is not None:
             st.caption("Confusion matrix: reference classes in rows, predictions in columns (1, 2, 3).")
-            matrix = metrics["confusion_matrix"]
-            st.dataframe([{"Reference class": str(i + 1),
-                           **{f"Predicted {j + 1}": int(value) for j, value in enumerate(row)}}
-                          for i, row in enumerate(matrix)], hide_index=True, width="stretch")
+            matrix_rows = []
+            for reference, counts in enumerate(metrics["confusion_matrix"], start=1):
+                row = {"Reference class": str(reference)}
+                for predicted, count in enumerate(counts, start=1):
+                    row[f"Predicted {predicted}"] = int(count)
+                matrix_rows.append(row)
+            st.dataframe(matrix_rows, hide_index=True, width="stretch")
         st.json({"selected_maps": report.get("selected_maps", []), "skipped": report.get("skipped", []),
                  "tiles": report.get("tiles", []), "policies": report.get("policies", {}),
                  "limitations": report.get("limitations", [])})

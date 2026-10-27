@@ -26,20 +26,20 @@ def _software_versions():
 def _metrics(matrix):
     """Calculate fixed-class metrics from a three-class confusion matrix."""
     matrix = np.asarray(matrix, dtype=np.int64)
-    n = int(matrix.sum())
+    total = int(matrix.sum())
     per_class = {}
-    for i, code in enumerate(CLASSES):
-        tp = int(matrix[i, i])
-        support, predicted = int(matrix[i].sum()), int(matrix[:, i].sum())
-        union = support + predicted - tp
+    for index, code in enumerate(CLASSES):
+        true_positive = int(matrix[index, index])
+        support, predicted = int(matrix[index].sum()), int(matrix[:, index].sum())
+        union = support + predicted - true_positive
         per_class[str(code)] = {
-            "precision": float(tp / predicted) if predicted else 0.0,
-            "recall": float(tp / support) if support else 0.0,
-            "f1": float(2 * tp / (support + predicted)) if support + predicted else 0.0,
-            "iou": float(tp / union) if union else 0.0, "support": support,
+            "precision": float(true_positive / predicted) if predicted else 0.0,
+            "recall": float(true_positive / support) if support else 0.0,
+            "f1": float(2 * true_positive / (support + predicted)) if support + predicted else 0.0,
+            "iou": float(true_positive / union) if union else 0.0, "support": support,
         }
-    return {"n": n, "accuracy": float(np.trace(matrix) / n) if n else 0.0,
-            "macro_f1": float(np.mean([c["f1"] for c in per_class.values()])),
+    return {"n": total, "accuracy": float(np.trace(matrix) / total) if total else 0.0,
+            "macro_f1": float(np.mean([metrics["f1"] for metrics in per_class.values()])),
             "per_class": per_class, "confusion_matrix": matrix.tolist()}
 
 

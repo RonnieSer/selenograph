@@ -47,7 +47,7 @@ LEGEND = {"slope": "Slope: bright is steep",
 
 def background_label(layer):
     """Format a background label, highlighting model input features."""
-    label = BACKGROUNDS[layer] if layer in BACKGROUNDS else str(layer)
+    label = BACKGROUNDS.get(layer, str(layer))
     return f":blue[{label}]" if layer in assistant_model.schema()["features"] else label
 
 
@@ -85,9 +85,11 @@ def data_stamp(dem_path):
                max_entries=3)
 def load(dem_path, revision):
     """Build terrain features and subsample the display and prediction grids."""
-    X, names, hs, prof, px = core.build(dem_path)
-    step = display_step(hs.shape)
-    return X, names, hs[::step, ::step], X[:, ::STRIDE, ::STRIDE], prof, px
+    features, names, hillshade, profile, pixel_size = core.build(dem_path)
+    step = display_step(hillshade.shape)
+    preview = hillshade[::step, ::step]
+    prediction_grid = features[:, ::STRIDE, ::STRIDE]
+    return features, names, preview, prediction_grid, profile, pixel_size
 
 
 def display_step(shape):
@@ -111,48 +113,51 @@ def backdrop(dem_path, revision, layer, _X, _names, _hs):
     if layer not in _names:
         return _hs
     step = display_step(_X.shape[1:])
-    v = _X[_names.index(layer), ::step, ::step]
-    good = np.isfinite(v)
-    if not good.any():
+    values = _X[_names.index(layer), ::step, ::step]
+    valid = np.isfinite(values)
+    if not valid.any():
         return np.zeros_like(_hs)
-    lo, hi = np.percentile(v[good], [2, 98])
-    if hi <= lo:                                   # Handle sparse binary layers.
-        lo, hi = v[good].min(), v[good].max()
-    return np.clip(np.where(good, (v - lo) / max(hi - lo, 1e-6), 0), 0, 1).astype(np.float32)
+    low, high = np.percentile(values[valid], [2, 98])
+    if high <= low:                              # Handle sparse binary layers.
+        low, high = values[valid].min(), values[valid].max()
+    brightness = np.where(valid, (values - low) / max(high - low, 1e-6), 0)
+    return np.clip(brightness, 0, 1).astype(np.float32)
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
 def hatching(shape):
     """Return solid, striped, and dotted pixel masks for confidence levels."""
-    i, j = np.indices(shape)
+    rows, columns = np.indices(shape)
     return {core.SURE: np.ones(shape, bool),
-            core.MOSTLY: (i + j) // 3 % 2 == 0,
-            core.UNSURE: (i % 4 < 2) & (j % 4 < 2)}
+            core.MOSTLY: (rows + columns) // 3 % 2 == 0,
+            core.UNSURE: (rows % 4 < 2) & (columns % 4 < 2)}
 
 
-def widen_stroke(m):
+def widen_stroke(mask):
     """Dilate sparse strokes while preserving filled loops."""
-    ys, xs = np.nonzero(m)
-    if ys.size == 0:
-        return m
-    bbox = (ys.max() - ys.min() + 1) * (xs.max() - xs.min() + 1)
-    return ndi.binary_dilation(m, iterations=1) if ys.size / bbox < 0.25 else m
+    rows, columns = np.nonzero(mask)
+    if rows.size == 0:
+        return mask
+    area = (rows.max() - rows.min() + 1) * (columns.max() - columns.min() + 1)
+    if rows.size / area < 0.25:
+        return ndi.binary_dilation(mask, iterations=1)
+    return mask
 
 
-def run(fn, *a):
+def run(operation, *args):
     """Call a model operation and display expected errors in Streamlit."""
     try:
-        return fn(*a)
-    except (NotImplementedError, ValueError, OSError) as e:
-        st.error(str(e))
+        return operation(*args)
+    except (NotImplementedError, ValueError, OSError) as error:
+        st.error(str(error))
         st.stop()
 
 
 def flip():
     """Toggle prediction and painting layers while preserving confidence display."""
-    alone = [layer for layer in ss.layers if layer != "Confidence"] == ["Prediction"]
-    ss.layers = (["Painting"] if alone else ["Prediction"]) + \
-        [layer for layer in ss.layers if layer == "Confidence"]
+    visible = [layer for layer in ss.layers if layer != "Confidence"]
+    comparison = ["Painting"] if visible == ["Prediction"] else ["Prediction"]
+    ss.layers = comparison + [layer for layer in ss.layers if layer == "Confidence"]
 
 
 ss = st.session_state
@@ -213,9 +218,9 @@ def disk_files():
                                              core.LEGACY_MIRRORED_DIR)}
     found = {}
     for root in (os.fspath(core.DEM_DIR), *outputs):
-        for directory, _, names in os.walk(root):
-            for n in names:
-                path = os.path.join(directory, n)
+        for directory, _, filenames in os.walk(root):
+            for filename in filenames:
+                path = os.path.join(directory, filename)
                 try:
                     stat = os.stat(path)
                     revision = (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino)
@@ -230,18 +235,25 @@ def disk_keys(files, maps):
 
     A map owns outputs whose directory or filename prefix matches its ID.
     """
-    own, shared = {name: [] for name in maps}, []
+    map_revisions = {name: [] for name in maps}
+    shared = []
     for path, revision, output in files:
         owners = set()
         if output:
-            base = os.path.basename(path)
-            owners = {part for part in Path(path).parts[:-1] if part in own}
-            owners |= {base[:i] for i, ch in enumerate(base) if ch in "_." and base[:i] in own}
+            owners = {part for part in Path(path).parts[:-1] if part in map_revisions}
+            filename = os.path.basename(path)
+            for position, character in enumerate(filename):
+                if character not in "_.":
+                    continue
+                prefix = filename[:position]
+                if prefix in map_revisions:
+                    owners.add(prefix)
         for name in owners:
-            own[name].append((path, revision))
+            map_revisions[name].append((path, revision))
         if not owners:
             shared.append((path, revision))
-    return {name: hash(tuple(v)) for name, v in own.items()}, hash(tuple(shared))
+    keys = {name: hash(tuple(revisions)) for name, revisions in map_revisions.items()}
+    return keys, hash(tuple(shared))
 
 
 @st.cache_resource
@@ -255,7 +267,8 @@ def per_map(what, name, key, compute):
     store = map_store()
     cached = store.get((what, name))
     if cached is None or cached[0] != key:
-        store[(what, name)] = cached = (key, compute())
+        cached = (key, compute())
+        store[(what, name)] = cached
     return cached[1]
 
 
@@ -265,16 +278,22 @@ def map_status(name, key):
         """Read annotation availability and verification metadata."""
         verified = core.meta_get(name).get("verified")
         labels = ["painted"] if core.load_painting(name).any() else []
-        return labels + ["verified"] * bool(verified), verified is True
+        if verified:
+            labels.append("verified")
+        return labels, verified is True
     return per_map("status", name, key, compute)
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
 def training_status(model_stamp, model_revision, maps, key, _bundle):
     """Check for model changes using cached inputs from verified maps."""
-    return assistant_model.training_changed(_bundle, maps, lambda name, path: per_map(
-        "training", name, (map_keys[name], shared_key, path),
-        lambda: assistant_model.current_training_input(name, path)))
+    def training_input(name, path):
+        """Reuse a map's training input until its files change."""
+        revision = (map_keys[name], shared_key, path)
+        return per_map("training", name, revision,
+                       lambda: assistant_model.current_training_input(name, path))
+
+    return assistant_model.training_changed(_bundle, maps, training_input)
 
 
 all_maps = {core.dem_name(d): d for d in all_dems}
@@ -287,9 +306,9 @@ training_key = hash((shared_key, *((n, map_keys[n]) for n in verified_training_m
 
 def marked(path):
     """Format a map name with painting and verification status."""
-    n = core.dem_name(path)
-    labels = statuses[n][0]
-    return f"{n} — {', '.join(labels)}" if labels else n
+    name = core.dem_name(path)
+    labels = statuses[name][0]
+    return f"{name} — {', '.join(labels)}" if labels else name
 
 
 with st.sidebar:
@@ -339,8 +358,8 @@ assert ss.cells is not None
 # Provenance may be refreshed without changing a raster's revision.
 ss.locked = bool(record.get("read_only"))
 ss.accepted = ss.accepted & (ss.cells > 0)
-ss.confidence = np.where(ss.cells > 0, np.where(ss.confidence > 0, ss.confidence, core.SURE),
-                         0).astype(np.uint8)
+confidence = np.where(ss.confidence > 0, ss.confidence, core.SURE)
+ss.confidence = np.where(ss.cells > 0, confidence, 0).astype(np.uint8)
 # Training weights reflect confidence; approved predictions receive half weight.
 # Smart fill preserves manual annotations in `hand`.
 hand = np.where(ss.accepted, 0, ss.cells).astype(np.uint8)
@@ -363,7 +382,6 @@ has_existing_labels = any(path and os.path.isfile(path) for path in (
     core.output_file(name, "labels.tif", existing=True),
     core.annotation_path(name, "painting"), core.annotation_path(name, "labels")))
 has_staged_metadata = os.path.isfile(core.output_file(name, "meta.json", final=False))
-is_verified = metadata.get("verified") is True
 training_changed = run(training_status, ss.assistant_stamp, ss.assistant["revision"],
                        verified_training_maps, training_key, ss.assistant)
 can_update = bool(verified_training_maps or ss.assistant["samples"])
@@ -418,9 +436,10 @@ with st.sidebar:
         help="Replace your draft with the saved painting. Undo is available.")
 
     st.subheader("4 · Update Model")
-    update_help = (("New verified edits." if training_changed else "Model up to date.") +
-                   " Retrain from all verified paintings." if can_update else
-                   "Verify a painted map to enable training.")
+    update_help = "Verify a painted map to enable training."
+    if can_update:
+        update_help = "New verified edits." if training_changed else "Model up to date."
+        update_help += " Retrain from all verified paintings."
     update_color = "yellow" if training_changed else "green"
     update = st.button(f":{update_color}[Update model]", key="update_model",
                        icon=":material/refresh:", width="stretch", disabled=not can_update,
@@ -440,11 +459,13 @@ with st.sidebar:
 
 def step(cells, accepted, confidence):
     """Save an editable painting change and retain the previous state for undo."""
-    if not editable or all(np.array_equal(before, after) for before, after in
-                           zip((ss.cells, ss.accepted, ss.confidence),
-                               (cells, accepted, confidence))):
+    if not editable:
         return
-    ss.hist = (ss.hist + [(ss.cells.copy(), ss.accepted.copy(), ss.confidence.copy())])[-UNDO:]
+    previous = (ss.cells, ss.accepted, ss.confidence)
+    updated = (cells, accepted, confidence)
+    if all(np.array_equal(before, after) for before, after in zip(previous, updated)):
+        return
+    ss.hist = (ss.hist + [tuple(values.copy() for values in previous)])[-UNDO:]
     ss.cells, ss.accepted, ss.confidence = cells, accepted, confidence
     core.save_painting(name, ss.cells, accepted=ss.accepted,
                        confidence=ss.confidence)
@@ -483,13 +504,16 @@ if update and can_update:
     ss.pop("conf_for", None)
     st.rerun()
 
+if tool == "smart":
+    instructions = (f"Smart fill: click a region to paint the model's outline of it as {unit}, or loop "
+                    f"an area to take only its {unit}. ")
+else:
+    instructions = "Loop to fill, drag to paint a band, click for one cell. "
 st.markdown(
     f'<div style="font-size:1.35rem;font-weight:600;line-height:1.3">'
     f'{name} — painting {chip(PAINT[unit], f"<b>{unit}</b>")}</div>'
     f'<div style="font-size:.85rem;opacity:.6;margin:.1em 0 .3em">'
-    + (f"Smart fill: click a region to paint the model's outline of it as {unit}, or loop "
-       f"an area to take only its {unit}. " if tool == "smart" else
-       "Loop to fill, drag to paint a band, click for one cell. ") +
+    f'{instructions}'
     f'Scroll to zoom, right-drag to pan, hold Space to hide the colours. '
     f"{model_name} · {px:.3g} m pixels · {cell_size} m cells"
     f'</div>', unsafe_allow_html=True)
@@ -542,10 +566,13 @@ else:
             codes = core.cells_to_labels(np.where(ss.confidence == level, ss.cells, 0), base.shape)
             codes[~drawn] = 0
             painting.append((codes, alpha))
-    img = pictures.render(base, [(ss.pred if "Prediction" in shown else None, alpha), *painting])
-missing = ~terrain_valid[::display_step(shape), ::display_step(shape)]
+    prediction_layer = ss.pred if "Prediction" in shown else None
+    img = pictures.render(base, [(prediction_layer, alpha), *painting])
+display_stride = display_step(shape)
+missing = ~terrain_valid[::display_stride, ::display_stride]
 if not confident and background in names:
-    missing |= ~np.isfinite(X[names.index(background), ::display_step(shape), ::display_step(shape)])
+    background_values = X[names.index(background), ::display_stride, ::display_stride]
+    missing |= ~np.isfinite(background_values)
 img = pictures.tile_frame(img, tile_bounds, missing=missing)
 bare = pictures.tile_frame(pictures.terrain(base), tile_bounds, missing=missing)
 stroke = canvas.map_canvas(img, terrain=bare, grid=GRID, height=MAP_H,
@@ -569,8 +596,10 @@ elif stroke and stroke.get("id") != ss.get("last_stroke"):
     code = PAINT[unit]
     if tool == "smart" and code:
         seed = divmod(int(stroke["cells"][0]), GRID)
-        region = (core.smart_fill(suggested, seed=seed) if stroke.get("click") else
-                  core.smart_fill(suggested, inside=hit, unit=code))
+        if stroke.get("click"):
+            region = core.smart_fill(suggested, seed=seed)
+        else:
+            region = core.smart_fill(suggested, inside=hit, unit=code)
         region &= (hand == 0) & valid_cells      # Preserve manual labels and NoData.
         if region.any():
             # Agreement retains prediction provenance; relabeling is a manual correction.
@@ -585,8 +614,11 @@ elif stroke and stroke.get("id") != ss.get("last_stroke"):
             st.toast("That region is already painted by hand.")
     else:
         # Painting over an approved prediction converts it to a manual annotation.
-        step(np.where(hit, code, ss.cells).astype(np.uint8), ss.accepted & ~hit,
-             sure_of(hit) if code else np.where(hit, 0, ss.confidence).astype(np.uint8))
+        if code:
+            confidence = sure_of(hit)
+        else:
+            confidence = np.where(hit, 0, ss.confidence).astype(np.uint8)
+        step(np.where(hit, code, ss.cells).astype(np.uint8), ss.accepted & ~hit, confidence)
         st.rerun()
 
 if save and can_save:
@@ -625,9 +657,13 @@ if save and can_save:
                                        for k in core.CONFIDENCE},
                   painted_area_km2=areas,
                   painted_frac=round(float((lab != 255).sum()) / max(1, int(valid.sum())), 4))
-    st.success(("Saved and marked **verified**" if verified else "Saved") +
-               f" — `{labels_path}` (your painting"
-               + (f", with accepted predictions marked in `{os.path.basename(accepted_path)}`)"
-                  if ss.accepted.any() else ")") +
-               (f" and `{prediction_path}` (the prediction)" if full_prediction is not None else
-                ". A prediction can be saved after training the first model."))
+    message = "Saved and marked **verified**" if verified else "Saved"
+    message += f" — `{labels_path}` (your painting"
+    if ss.accepted.any():
+        message += f", with accepted predictions marked in `{os.path.basename(accepted_path)}`"
+    message += ")"
+    if full_prediction is not None:
+        message += f" and `{prediction_path}` (the prediction)"
+    else:
+        message += ". A prediction can be saved after training the first model."
+    st.success(message)

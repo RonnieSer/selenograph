@@ -27,14 +27,14 @@ def render(base, layers):
     for layer, alpha in layers:
         if layer is None or alpha <= 0:
             continue
-        p = layer if layer.shape == base.shape else np.array(
-            Image.fromarray(layer).resize(base.shape[::-1], Image.NEAREST))
+        if layer.shape != base.shape:
+            layer = np.array(Image.fromarray(layer).resize(base.shape[::-1], Image.NEAREST))
         for code in core.CODES:
-            m = p == code
-            if m.any():
+            selected = layer == code
+            if selected.any():
                 colour = np.array(core.CMAP[code][:3]) / 255.0
-                tint = np.clip(shade[m] * colour / (colour @ LUMA), 0, 1)
-                rgb[m] = (1 - alpha) * rgb[m] + alpha * tint
+                tint = np.clip(shade[selected] * colour / (colour @ LUMA), 0, 1)
+                rgb[selected] = (1 - alpha) * rgb[selected] + alpha * tint
     return Image.fromarray((np.clip(rgb, 0, 1) * 255).astype(np.uint8))
 
 
@@ -44,11 +44,13 @@ def disagreement(base, prediction, cells, alpha):
     Use painting cell edges and nearest-neighbour prediction resampling.
     Ignore unpainted cells and missing predictions.
     """
-    predicted = prediction if prediction.shape == base.shape else np.asarray(
-        Image.fromarray(prediction).resize(base.shape[::-1], Image.Resampling.NEAREST))
+    predicted = prediction
+    if predicted.shape != base.shape:
+        predicted = np.asarray(
+            Image.fromarray(prediction).resize(base.shape[::-1], Image.Resampling.NEAREST))
     painted = core.cells_to_labels(cells, base.shape)
-    different = (np.isin(predicted, list(core.CODES)) & np.isin(painted, list(core.CODES))
-                 & (predicted != painted))
+    known = np.isin(predicted, list(core.CODES)) & np.isin(painted, list(core.CODES))
+    different = known & (predicted != painted)
     rgb = np.repeat(np.clip(base, 0, 1)[:, :, None], 3, axis=2).astype(np.float32) * 255
     rgb[different] = (1 - alpha) * rgb[different] + alpha * DISAGREEMENT
     return Image.fromarray(np.clip(rgb, 0, 255).astype(np.uint8))
@@ -64,11 +66,11 @@ def resized(values, shape):
     if values.shape == tuple(shape):
         return values
     missing = np.isnan(values)
-    img = Image.fromarray(np.where(missing, 0, values).astype(np.float32), mode="F")
-    out = np.array(img.resize(shape[::-1], Image.BILINEAR))
-    gone = np.array(Image.fromarray(missing.astype(np.uint8) * 255).resize(
-        shape[::-1], Image.NEAREST)) > 0
-    return np.where(gone, np.nan, out)
+    image = Image.fromarray(np.where(missing, 0, values).astype(np.float32), mode="F")
+    resized_values = np.array(image.resize(shape[::-1], Image.BILINEAR))
+    mask = Image.fromarray(missing.astype(np.uint8) * 255)
+    resized_missing = np.array(mask.resize(shape[::-1], Image.NEAREST)) > 0
+    return np.where(resized_missing, np.nan, resized_values)
 
 
 def confidence_base(conf, shape):
@@ -86,9 +88,9 @@ def whiten(picture, blank):
 
 def png(image):
     """Encode a PIL image as PNG bytes."""
-    buf = io.BytesIO()
-    image.save(buf, format="PNG")
-    return buf.getvalue()
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 @core.catalog_snapshot()
@@ -101,35 +103,38 @@ def tile_bounds(name, shape, transform):
     """
     record = core.map_record(name) or {}
     grid = record.get("grid", {})
-    h, w = record.get("size", grid.get("shape", shape))
-    tr = Affine(*record.get("transform", grid.get("transform", transform))[:6])
-    side, row, col = max(h, w), 0, 0
+    height, width = record.get("size", grid.get("shape", shape))
+    raster_transform = Affine(*record.get("transform", grid.get("transform", transform))[:6])
+    side, row, column = max(height, width), 0, 0
     section = core.section(record) if record.get("working_dem") else None
     peers = []
     for peer in core.records() if section else ():
         other_grid = peer.get("grid", {})
         size = peer.get("size", other_grid.get("shape"))
-        other_tr = peer.get("transform", other_grid.get("transform"))
-        if not size or not other_tr or core.section(peer) != section:
+        other_transform = peer.get("transform", other_grid.get("transform"))
+        if not size or not other_transform or core.section(peer) != section:
             continue
-        ph, pw = size
-        if ph != pw or ph < side:
+        peer_height, peer_width = size
+        if peer_height != peer_width or peer_height < side:
             continue
-        crs, other_crs = record.get("crs", grid.get("crs_wkt")), peer.get("crs", other_grid.get("crs_wkt"))
+        crs = record.get("crs", grid.get("crs_wkt"))
+        other_crs = peer.get("crs", other_grid.get("crs_wkt"))
         if crs and other_crs and crs != other_crs:
             continue
-        pt = Affine(*other_tr[:6])
-        if np.allclose((tr.a, tr.b, tr.d, tr.e), (pt.a, pt.b, pt.d, pt.e), rtol=0, atol=1e-8):
-            peers.append((ph, pt))
+        peer_transform = Affine(*other_transform[:6])
+        raster_axes = (raster_transform.a, raster_transform.b, raster_transform.d, raster_transform.e)
+        peer_axes = (peer_transform.a, peer_transform.b, peer_transform.d, peer_transform.e)
+        if np.allclose(raster_axes, peer_axes, rtol=0, atol=1e-8):
+            peers.append((peer_height, peer_transform))
     for nominal, origin in sorted(peers, key=lambda p: p[0], reverse=True):
-        x, y = ~origin @ (tr.c, tr.f)
+        x, y = ~origin @ (raster_transform.c, raster_transform.f)
         if not np.allclose((x, y), (round(x), round(y)), rtol=0, atol=1e-5):
             continue
         x, y = round(x) % nominal, round(y) % nominal
-        if x + w <= nominal and y + h <= nominal:
-            side, row, col = nominal, y, x
+        if x + width <= nominal and y + height <= nominal:
+            side, row, column = nominal, y, x
             break
-    return (col / side, row / side, w / side, h / side)
+    return (column / side, row / side, width / side, height / side)
 
 
 def blacken(image, missing):
@@ -142,11 +147,12 @@ def blacken(image, missing):
 
 def tile_frame(image, bounds, *, missing=None, size=None):
     """Place a raster in its square tile with opaque black NoData."""
-    x, y, w, h = bounds
-    size = size or max(1, round(max(image.width / w, image.height / h)))
+    x, y, width, height = bounds
+    size = size or max(1, round(max(image.width / width, image.height / height)))
     left, top = round(x * size), round(y * size)
-    right, bottom = round((x + w) * size), round((y + h) * size)
-    fitted = image.convert("RGB").resize((max(1, right - left), max(1, bottom - top)), Image.Resampling.LANCZOS)
+    right, bottom = round((x + width) * size), round((y + height) * size)
+    fitted_size = (max(1, right - left), max(1, bottom - top))
+    fitted = image.convert("RGB").resize(fitted_size, Image.Resampling.LANCZOS)
     if missing is not None:
         fitted = blacken(fitted, missing)
     frame = Image.new("RGB", (size, size), "black")

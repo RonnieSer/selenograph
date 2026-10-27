@@ -219,11 +219,11 @@ def grid(src):
 
 def validate_sfs_grid(src):
     """Validate and describe a finite, north-up projected SfS grid."""
-    t = src.transform
+    transform = src.transform
     require(src.count == 1 and src.width > 0 and src.height > 0
             and src.crs is not None and src.crs.is_projected
-            and all(math.isfinite(v) for v in (*t, *src.bounds, t.determinant))
-            and t.a > 0 and t.e < 0 and t.b == t.d == 0 and t.determinant < 0,
+            and all(math.isfinite(v) for v in (*transform, *src.bounds, transform.determinant))
+            and transform.a > 0 and transform.e < 0 and transform.b == transform.d == 0 and transform.determinant < 0,
             "Invalid native SfS grid: require finite north-up projected grid with positive spacing")
     return grid(src)
 
@@ -240,7 +240,7 @@ def native_record(src):
 
 def layer_path(tile_id, layer):
     """Return the region-relative path for a tile layer."""
-    folder = "imagery" if layer == "nac" else "elevation" if layer == "sfs" else "quality"
+    folder = {"nac": "imagery", "sfs": "elevation"}.get(layer, "quality")
     stem = tile_id if layer == "sfs" else f"{tile_id}_{layer}"
     return f"tiles/{tile_id}/{folder}/{stem}.tif"
 
@@ -280,7 +280,7 @@ def evidence_path(region, key):
     return f"metadata/{region}_{key}.{'txt' if key == 'readme' else 'csv'}"
 
 
-def profile(target, nodata: float | None = float("nan")):
+def profile(target, nodata=float("nan")):
     """Return the output GeoTIFF profile for a target grid."""
     return {"driver": "GTiff", "width": target["width"], "height": target["height"],
             "transform": rasterio.Affine(*target["transform"]), "crs": target["crs_wkt"],
@@ -358,13 +358,16 @@ def write_masks(root, tile_id, target, deadline=None):
             rasterio.open(root / layer_path(tile_id, "sfs")) as sfs, \
             rasterio.open(root / layer_path(tile_id, "image_count")) as count:
         for name in MASKS:
+            other = nac if name == "valid_data" else count
             with rasterio.open(root / layer_path(tile_id, name), "w", **profile(target, None)) as dst:
-                for _, w in dst.block_windows(1):
+                for _, window in dst.block_windows(1):
                     checkpoint(deadline)
-                    good = np.isfinite(sfs.read(1, window=w))
-                    other = nac.read(1, window=w) if name == "valid_data" else count.read(1, window=w)
-                    good &= np.isfinite(other) & (True if name == "valid_data" else other > 0)
-                    dst.write(good.astype("float32"), 1, window=w)
+                    good = np.isfinite(sfs.read(1, window=window))
+                    values = other.read(1, window=window)
+                    good &= np.isfinite(values)
+                    if name != "valid_data":
+                        good &= values > 0
+                    dst.write(good.astype("float32"), 1, window=window)
 
 
 def raster_stats(path, target, is_mask, deadline=None):
@@ -373,16 +376,20 @@ def raster_stats(path, target, is_mask, deadline=None):
     with rasterio.open(path) as src:
         require(validate_sfs_grid(src) == target and src.dtypes == ("float32",), f"Grid/type mismatch: {path}")
         require(src.compression and src.compression.value.upper() == "DEFLATE", f"Compression mismatch: {path}")
-        require(src.nodata is None if is_mask else src.nodata is not None and math.isnan(src.nodata), f"Nodata mismatch: {path}")
-        for _, w in src.block_windows(1):
+        if is_mask:
+            valid_nodata = src.nodata is None
+        else:
+            valid_nodata = src.nodata is not None and math.isnan(src.nodata)
+        require(valid_nodata, f"Nodata mismatch: {path}")
+        for _, window in src.block_windows(1):
             checkpoint(deadline)
-            a = src.read(1, window=w)
-            finite = np.isfinite(a)
-            require(not np.isinf(a).any() and np.array_equal(src.read_masks(1, window=w) > 0, finite), f"Invalid mask: {path}")
+            values = src.read(1, window=window)
+            finite = np.isfinite(values)
+            require(not np.isinf(values).any() and np.array_equal(src.read_masks(1, window=window) > 0, finite), f"Invalid mask: {path}")
             if is_mask:
-                require(np.isin(a, [0, 1]).all(), f"Nonbinary support mask: {path}")
+                require(np.isin(values, [0, 1]).all(), f"Nonbinary support mask: {path}")
             valid += int(finite.sum())
-            zeros += int((a == 0).sum())
+            zeros += int((values == 0).sum())
         return {"total": src.width * src.height, "valid": valid,
                 "nodata": src.width * src.height - valid, "zero": zeros}
 
@@ -483,27 +490,27 @@ def registered_ids(root, output):
 def verify_region(root, region, archive, selected, deadline=None):
     """Validate tile coverage, catalogs, hashes, grids, and support masks."""
     metadata_name = f"metadata/{region}_metadata.json"
-    m = read_json(root / metadata_name)
-    require(m["config"] == CONFIG and m["region"] == region
-            and all(m["archive"][k] == archive[k] for k in ("name", "bytes", "sha256", "md5"))
-            and m["archive"]["published_md5"] in (None, archive["md5"]), f"Region source/config mismatch: {region}")
-    require(set(m["sources"]) == set(selected), f"Source selection mismatch: {region}")
+    metadata = read_json(root / metadata_name)
+    require(metadata["config"] == CONFIG and metadata["region"] == region
+            and all(metadata["archive"][k] == archive[k] for k in ("name", "bytes", "sha256", "md5"))
+            and metadata["archive"]["published_md5"] in (None, archive["md5"]), f"Region source/config mismatch: {region}")
+    require(set(metadata["sources"]) == set(selected), f"Source selection mismatch: {region}")
     expected = {metadata_name, f"metadata/{region}_quality_report.json", "working_dems.json"}
     raster_keys = set()
     for key, info in selected.items():
-        source = m["sources"][key]
+        source = metadata["sources"][key]
         require((source["member"], source["bytes"], source["crc32"]) == (info.filename, info.file_size, info.CRC),
                 f"Source inventory mismatch: {region}/{key}")
         if key == "readme" or key.startswith("evidence_"):
             expected.add(evidence_path(region, key))
         else:
             raster_keys.add(key)
-    require(m["grid"] == m["sources"]["sfs"]["native"]["grid"] and m["mask_definitions"] == MASKS,
+    require(metadata["grid"] == metadata["sources"]["sfs"]["native"]["grid"] and metadata["mask_definitions"] == MASKS,
             f"SfS grid/mask definition mismatch: {region}")
-    layout = list(tile_layout(region, m["grid"]))
-    require(m["tile_count"] == len(layout) == len(m["tiles"]), f"Tile coverage/count mismatch: {region}")
+    layout = list(tile_layout(region, metadata["grid"]))
+    require(metadata["tile_count"] == len(layout) == len(metadata["tiles"]), f"Tile coverage/count mismatch: {region}")
     rasters = {}
-    for tile, canonical in zip(m["tiles"], layout):
+    for tile, canonical in zip(metadata["tiles"], layout):
         checkpoint(deadline)
         require(all(tile[key] == value for key, value in canonical.items()), f"Tile coverage/window mismatch: {region}")
         rasters.update({layer_path(tile["tile_id"], key): (tile, key) for key in raster_keys | MASKS.keys()})
@@ -511,8 +518,8 @@ def verify_region(root, region, archive, selected, deadline=None):
     expected_dirs = {p.as_posix() for name in expected for p in PurePosixPath(name).parents if p != PurePosixPath(".")}
     files, dirs = tree(root)
     require(files == expected and dirs == expected_dirs, f"Unlisted/missing paths: {region}")
-    require(set(m["outputs"]) == expected - {metadata_name}, f"Output inventory mismatch: {region}")
-    for name, record in m["outputs"].items():
+    require(set(metadata["outputs"]) == expected - {metadata_name}, f"Output inventory mismatch: {region}")
+    for name, record in metadata["outputs"].items():
         path = root / name
         require(digest(path, deadline) == record["checksum"], f"Modified output: {path}")
         if name in rasters:
@@ -521,27 +528,27 @@ def verify_region(root, region, archive, selected, deadline=None):
                     and record["tile_id"] == tile["tile_id"], f"Layer/grid mismatch: {path}")
             require(raster_stats(path, tile["grid"], layer in MASKS, deadline) == record["pixels"], f"Pixel counts mismatch: {path}")
             with rasterio.open(path) as src:
-                native = m["sources"][layer]["native"] if layer not in MASKS else {"scales": [1.0], "offsets": [0.0], "units": [None]}
+                native = metadata["sources"][layer]["native"] if layer not in MASKS else {"scales": [1.0], "offsets": [0.0], "units": [None]}
                 require(all(list(getattr(src, k)) == native[k] for k in ("scales", "offsets", "units")), f"Units/scales mismatch: {path}")
-    for tile in m["tiles"]:
+    for tile in metadata["tiles"]:
         tile_id = tile["tile_id"]
-        require(all(tile[key] == value for key, value in tile_counts(tile, m["outputs"]).items()), f"Tile valid counts mismatch: {tile_id}")
+        require(all(tile[key] == value for key, value in tile_counts(tile, metadata["outputs"]).items()), f"Tile valid counts mismatch: {tile_id}")
         with rasterio.open(root / layer_path(tile_id, "nac")) as nac, rasterio.open(root / layer_path(tile_id, "sfs")) as sfs, \
                 rasterio.open(root / layer_path(tile_id, "image_count")) as count:
             for name in MASKS:
                 with rasterio.open(root / layer_path(tile_id, name)) as mask:
-                    for _, w in mask.block_windows(1):
+                    for _, window in mask.block_windows(1):
                         checkpoint(deadline)
-                        other = nac.read(1, window=w) if name == "valid_data" else count.read(1, window=w)
-                        expected_mask = np.isfinite(sfs.read(1, window=w)) & np.isfinite(other)
+                        other = nac.read(1, window=window) if name == "valid_data" else count.read(1, window=window)
+                        expected_mask = np.isfinite(sfs.read(1, window=window)) & np.isfinite(other)
                         if name == "sfs_support":
                             expected_mask &= other > 0
-                        require(np.array_equal(mask.read(1, window=w), expected_mask), f"Support mismatch: {tile_id}/{name}")
+                        require(np.array_equal(mask.read(1, window=window), expected_mask), f"Support mismatch: {tile_id}/{name}")
     require(read_json(root / "working_dems.json") ==
-            [catalog_record(region, tile, raster_keys | MASKS.keys()) for tile in m["tiles"]], f"Catalog path/record mismatch: {region}")
+            [catalog_record(region, tile, raster_keys | MASKS.keys()) for tile in metadata["tiles"]], f"Catalog path/record mismatch: {region}")
     quality = read_json(root / f"metadata/{region}_quality_report.json")
-    require(quality == m["quality"] and quality["missing_optional"] == sorted(OPTIONAL - selected.keys()), f"Quality report mismatch: {region}")
-    return {"archive": m["archive"], "tile_count": len(layout),
+    require(quality == metadata["quality"] and quality["missing_optional"] == sorted(OPTIONAL - selected.keys()), f"Quality report mismatch: {region}")
+    return {"archive": metadata["archive"], "tile_count": len(layout),
             "metadata_sha256": digest(root / metadata_name, deadline)["sha256"]}
 
 
@@ -600,8 +607,10 @@ def build_region(output, region, archive, source, selected, deadline=None, *, ot
                                  "grid": tile["grid"], "pixels": raster_stats(root / name, tile["grid"], key in MASKS, deadline)}
             tile.update(tile_counts(tile, outputs))
             tiles.append(tile)
-        quality = {"missing_optional": sorted(OPTIONAL - selected.keys()), "warnings": CAVEATS +
-                   ([] if source["published_md5"] else ["No published MD5 supplied; local SHA256 is provenance, not publisher authentication."])}
+        warnings = CAVEATS.copy()
+        if not source["published_md5"]:
+            warnings.append("No published MD5 supplied; local SHA256 is provenance, not publisher authentication.")
+        quality = {"missing_optional": sorted(OPTIONAL - selected.keys()), "warnings": warnings}
         write_json(root / f"metadata/{region}_quality_report.json", quality)
         write_json(root / "working_dems.json", [catalog_record(region, tile, layers) for tile in tiles])
         for name in ["working_dems.json", f"metadata/{region}_quality_report.json",
@@ -641,8 +650,11 @@ def run_locked(args, raw, output, deadline=None):
     selectors = args.region or []
     selected_regions = set()
     for selector in selectors:
-        matches = [r for r, p in archives.items() if (match := ARCHIVE_RE.fullmatch(p.name)) is not None
-                   and selector.lower() in (r, p.stem.lower(), match[1])]
+        matches = []
+        for region, path in archives.items():
+            match = ARCHIVE_RE.fullmatch(path.name)
+            if match and selector.lower() in (region, path.stem.lower(), match[1]):
+                matches.append(region)
         require(len(matches) == 1, f"Unknown/ambiguous region: {selector}")
         selected_regions.update(matches)
     if not selectors and not args.verify:

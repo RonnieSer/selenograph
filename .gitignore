@@ -24,7 +24,6 @@
 .codex/
 __pycache__/
 *.pyc
-.pytest_cache/
 .selenograph-json-*
 .DS_Store
 ._*

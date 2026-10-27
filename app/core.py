@@ -24,7 +24,6 @@ import rasterio
 from rasterio.warp import Resampling, reproject
 from scipy import ndimage as ndi
 
-from app import paths
 from app.paths import DEM_DIR, DRAFT_DIR, LEGACY_DRAFT_DIR, LEGACY_MIRRORED_DIR, LEGACY_OUT_DIR, MAP_DIR, OUT_DIR
 
 SUFFIXES = ("_psr", "_cpr", "_nac", "_quality", "_mask")  # Companion raster suffixes.
@@ -49,9 +48,6 @@ CURV_M = 60          # Curvature smoothing window, in metres.
 SKY_LOCAL_M = 300    # Local sky-view radius, in metres.
 FEATURE_VERSION = 6  # Shared source terrain for neighbourhood features.
 
-# Persistent test-map selections are used only by offline evaluation helpers.
-TEST_MAPS_FILE = paths.TEST_MAPS_FILE
-DEFAULT_TEST_MAPS = []
 APPROVED = 0.5       # Training weight for accepted predictions.
 
 # Scene-relative elevation and sensor layers are excluded from training features.
@@ -61,7 +57,7 @@ BASE_FEATS = ["slope", "rough", "svf", "rel_local", "curv", "svf_local"]
 # Select a model_<name>.py backend through SELENOGRAPH_MODEL.
 MODEL = os.environ.get("SELENOGRAPH_MODEL", "rf")
 
-# Backends expose NAME, fit, fit_rows, predict, and confidence. Features have
+# Backends expose NAME, fit_rows, predict, and confidence. Features have
 # shape (n_features, height, width); painting cells have shape (GRID, GRID).
 # Zero marks unknown cells. Predictions use 255 for missing terrain;
 # confidence arrays use NaN.
@@ -82,22 +78,24 @@ def backend(name=None):
 
 def read(path, max_side=None):
     """Read band 1 as float32 with nodata as NaN, optionally decimated."""
-    with rasterio.open(path) as s:
-        h, w = s.height, s.width
-        if max_side and max(h, w) > max_side:
-            k = max(h, w) / max_side
-            h, w = max(1, int(round(h / k))), max(1, int(round(w / k)))
-            a = s.read(1, out_shape=(h, w), resampling=Resampling.average)
-            tr = s.transform * rasterio.Affine.scale(s.width / w, s.height / h)
+    with rasterio.open(path) as source:
+        height, width = source.height, source.width
+        if max_side and max(height, width) > max_side:
+            scale = max(height, width) / max_side
+            height = max(1, int(round(height / scale)))
+            width = max(1, int(round(width / scale)))
+            values = source.read(1, out_shape=(height, width), resampling=Resampling.average)
+            transform = source.transform * rasterio.Affine.scale(
+                source.width / width, source.height / height)
         else:
-            a = s.read(1)
-            tr = s.transform
-        a = a.astype(np.float32)
-        if s.nodata is not None:
-            a[a == s.nodata] = np.nan
+            values = source.read(1)
+            transform = source.transform
+        values = values.astype(np.float32)
+        if source.nodata is not None:
+            values[values == source.nodata] = np.nan
         # Float64 PDS missing constants may appear unmasked in float32 bands.
-        a[np.abs(a) > 1e30] = np.nan
-        return a, tr, s.crs, abs(tr.a)
+        values[np.abs(values) > 1e30] = np.nan
+        return values, transform, source.crs, abs(transform.a)
 
 
 def warp(arr, tr, crs, ref, resampling=Resampling.bilinear):
@@ -117,11 +115,11 @@ def warp(arr, tr, crs, ref, resampling=Resampling.bilinear):
 
 def fill_nan(a):
     """Fill NaNs from the nearest valid pixel and return the original NaN mask."""
-    m = np.isnan(a)
-    if not m.any():
-        return a, m
-    idx = ndi.distance_transform_edt(m, return_distances=False, return_indices=True)
-    return a[tuple(idx)], m
+    missing = np.isnan(a)
+    if not missing.any():
+        return a, missing
+    nearest = ndi.distance_transform_edt(missing, return_distances=False, return_indices=True)
+    return a[tuple(nearest)], missing
 
 
 def window(metres, px):
@@ -131,9 +129,9 @@ def window(metres, px):
 
 def local_std(a, sigma):
     """Calculate local standard deviation within a Gaussian window."""
-    m = ndi.gaussian_filter(a, sigma)
-    m2 = ndi.gaussian_filter(a * a, sigma)
-    return np.sqrt(np.maximum(m2 - m * m, 0))
+    mean = ndi.gaussian_filter(a, sigma)
+    mean_square = ndi.gaussian_filter(a * a, sigma)
+    return np.sqrt(np.maximum(mean_square - mean * mean, 0))
 
 
 def sky_view(z, px, n_az=16, max_m=10000, n_ray=48, ds=4):
@@ -142,25 +140,33 @@ def sky_view(z, px, n_az=16, max_m=10000, n_ray=48, ds=4):
     Use logarithmically spaced rays on a downsampled grid, then resample to the
     input shape.
     """
-    zc = ndi.zoom(z, 1.0 / ds, order=1)
-    pxc = px * ds
-    d = np.unique(np.round(np.logspace(0, np.log10(max(max_m / pxc, 2)), n_ray)).astype(int))
-    acc = np.zeros_like(zc, np.float32)
-    for k in range(n_az):
-        a = 2 * np.pi * k / n_az
-        hmax = np.zeros_like(zc, np.float32)
-        for dd in d[d >= 1]:
-            dr, dc = int(round(dd * np.cos(a))), int(round(dd * np.sin(a)))
-            if dr == 0 and dc == 0:
+    terrain = ndi.zoom(z, 1.0 / ds, order=1)
+    pixel_size = px * ds
+    ray_steps = np.logspace(0, np.log10(max(max_m / pixel_size, 2)), n_ray)
+    distances = np.unique(np.round(ray_steps).astype(int))
+    sky = np.zeros_like(terrain, np.float32)
+    for direction in range(n_az):
+        angle = 2 * np.pi * direction / n_az
+        horizon = np.zeros_like(terrain, np.float32)
+        for distance in distances[distances >= 1]:
+            row_shift = int(round(distance * np.cos(angle)))
+            col_shift = int(round(distance * np.sin(angle)))
+            if row_shift == 0 and col_shift == 0:
                 continue
-            sh = np.roll(np.roll(zc, -dr, 0), -dc, 1)
-            if dr > 0:   sh[-dr:, :] = zc[-dr:, :]      # Clamp raster boundaries.
-            elif dr < 0: sh[:-dr, :] = zc[:-dr, :]
-            if dc > 0:   sh[:, -dc:] = zc[:, -dc:]
-            elif dc < 0: sh[:, :-dc] = zc[:, :-dc]
-            np.maximum(hmax, (sh - zc) / (dd * pxc), out=hmax)
-        acc += 1.0 - np.sin(np.arctan(hmax))
-    out = ndi.zoom(acc / n_az, (z.shape[0] / zc.shape[0], z.shape[1] / zc.shape[1]), order=1)
+            shifted = np.roll(np.roll(terrain, -row_shift, 0), -col_shift, 1)
+            # Clamp the raster edges instead of wrapping to the opposite side.
+            if row_shift > 0:
+                shifted[-row_shift:, :] = terrain[-row_shift:, :]
+            elif row_shift < 0:
+                shifted[:-row_shift, :] = terrain[:-row_shift, :]
+            if col_shift > 0:
+                shifted[:, -col_shift:] = terrain[:, -col_shift:]
+            elif col_shift < 0:
+                shifted[:, :-col_shift] = terrain[:, :-col_shift]
+            np.maximum(horizon, (shifted - terrain) / (distance * pixel_size), out=horizon)
+        sky += 1.0 - np.sin(np.arctan(horizon))
+    scale = (z.shape[0] / terrain.shape[0], z.shape[1] / terrain.shape[1])
+    out = ndi.zoom(sky / n_az, scale, order=1)
     return out[:z.shape[0], :z.shape[1]]
 
 
@@ -226,11 +232,13 @@ def _catalog():
         except FileNotFoundError:                 # Catalog directories may be replaced.
             continue
         stamps.append((manifest, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino))
-    flat = tuple(str(_catalog_path(root, p)) for p in sorted(root.glob("*"))
-                 if not p.name.startswith(".") and p.is_file()
-                 and p.suffix.lower() in (".tif", ".tiff")
-                 and not p.stem.lower().endswith(SUFFIXES))
-    return _load_catalog(root, tuple(stamps), flat)
+    flat = []
+    for path in sorted(root.glob("*")):
+        if path.name.startswith(".") or not path.is_file():
+            continue
+        if path.suffix.lower() in (".tif", ".tiff") and not path.stem.lower().endswith(SUFFIXES):
+            flat.append(str(_catalog_path(root, path)))
+    return _load_catalog(root, tuple(stamps), tuple(flat))
 
 
 @lru_cache(maxsize=8)
@@ -255,7 +263,10 @@ def _load_catalog(root, stamps, flat):
                 return path
             if isinstance(value, dict):
                 if "path" in value:
-                    return dict(value, path=layer_paths(value["path"])) if value["path"] else dict(value)
+                    result = dict(value)
+                    if value["path"]:
+                        result["path"] = layer_paths(value["path"])
+                    return result
                 if "status" in value:
                     return dict(value)
                 return {k: layer_paths(v) for k, v in value.items()}
@@ -329,10 +340,15 @@ def records():
 
 def record_path(record, layer=None):
     """Resolve a normalized catalog record's DEM or named layer to an absolute path."""
-    value = record.get("working_dem") if layer is None else record.get("layers", {}).get(layer)
+    if layer is None:
+        value = record.get("working_dem")
+    else:
+        value = record.get("layers", {}).get(layer)
     if isinstance(value, dict):
         value = value.get("path")
-    return str(_catalog_path(Path(DEM_DIR).resolve(), value)) if value else None
+    if not value:
+        return None
+    return str(_catalog_path(Path(DEM_DIR).resolve(), value))
 
 
 def annotation_path(name, kind):
@@ -363,7 +379,9 @@ def map_record(name):
     by_name = _catalog()[1]
     # IDs may contain dots; strip a file extension only when the exact ID is absent.
     record = by_name.get(os.fspath(name))
-    return deepcopy(record if record is not None else by_name.get(dem_name(name)))
+    if record is None:
+        record = by_name.get(dem_name(name))
+    return deepcopy(record)
 
 
 def dem_path(name):
@@ -377,81 +395,21 @@ def dem_path(name):
         return files[value]
     if dem_name(value) in files:
         return files[dem_name(value)]
-    key = (dem_name(value) if Path(value).name != value or
-           Path(value).suffix.lower() in (".tif", ".tiff") else value)
+    key = value
+    if Path(value).name != value or Path(value).suffix.lower() in (".tif", ".tiff"):
+        key = dem_name(value)
     return str((Path(DEM_DIR) / f"{key}.tif").resolve())
 
 
 def map_site(name):
     """Return the declared geographic group or site for a map."""
-    r = map_record(name)
-    if r:
-        return r.get("group", r.get("site"))
-    path = next((p for p in dem_files() if dem_name(p) == name), None)
-    return site_id(path) if path else None
-
-
-def test_maps_path():
-    """Resolve the offline test-map selection path for the current catalog."""
-    if Path(TEST_MAPS_FILE) != paths.TEST_MAPS_FILE:
-        return Path(TEST_MAPS_FILE) if Path(TEST_MAPS_FILE).is_absolute() else Path(DEM_DIR) / TEST_MAPS_FILE
-    if Path(DEM_DIR).resolve() != paths.DEM_DIR:
-        return Path(DEM_DIR) / "test_maps.json"
-    return paths.TEST_MAPS_FILE
-
-
-def test_maps():
-    """Return configured offline test maps that exist in the current catalog."""
-    try:
-        with open(test_maps_path(), encoding="utf-8") as f:
-            names = [str(n) for n in json.load(f)]
-    except (OSError, ValueError, TypeError):
-        names = DEFAULT_TEST_MAPS
-    have = {dem_name(p) for p in dem_files()}
-    return [n for n in names if n in have]
-
-
-def set_test_maps(names):
-    """Save a unique, sorted offline test-map selection atomically."""
-    path = test_maps_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    staged = path.with_suffix(path.suffix + ".tmp")
-    with open(staged, "w", encoding="utf-8") as f:
-        json.dump(sorted(set(names)), f, indent=1)
-    os.replace(staged, path)
-
-
-def extents():
-    """Return map bounds as (left, bottom, right, top) in each map's CRS."""
-    out = {}
-    for r in records():
-        if "transform" in r and "size" in r:
-            a, (H, W) = r["transform"], r["size"]
-            out[dem_name(r["working_dem"])] = (a[2], a[5] + a[4] * H, a[2] + a[0] * W, a[5])
-    for p in dem_files():
-        if dem_name(p) not in out:
-            with rasterio.open(p) as src:
-                out[dem_name(p)] = tuple(src.bounds)
-    return out
-
-
-def held_out_maps(names=None):
-    """Return test maps and maps intersecting their buffered bounds.
-
-    Expand each test extent by half its width to exclude neighbouring training
-    terrain in the offline holdout workflow.
-    """
-    names = set(test_maps() if names is None else names)
-    if not names:
-        return names
-    box = extents()
-    near = []
-    for n in names & box.keys():
-        l, b, r, t = box[n]
-        m = (r - l) / 2                                # Buffer by half the map width.
-        near.append((l - m, b - m, r + m, t + m))
-    return names | {n for n, (l, b, r, t) in box.items()
-                    if any(l < R and r > L and b < T and t > B for L, B, R, T in near)}
+    record = map_record(name)
+    if record:
+        return record.get("group", record.get("site"))
+    for path in dem_files():
+        if dem_name(path) == name:
+            return site_id(path)
+    return None
 
 
 def dem_name(path):
@@ -553,8 +511,10 @@ def output_file(name, filename, *, existing=False, final=True):
     """
     name, filename = _output_component(name), _output_component(filename)
     export = final and filename in ("labels.tif", "map.tif")
-    target = (_output_path(MAP_DIR, _output_relative_dir(name) / f"{name}_{filename}")
-              if export else _painting_output_file(name, filename, final))
+    if export:
+        target = _output_path(MAP_DIR, _output_relative_dir(name) / f"{name}_{filename}")
+    else:
+        target = _painting_output_file(name, filename, final)
     if existing:
         markers = ("painting.npy", "labels.tif") if final else ("painting.npy",)
         current = [output_file(name, m, final=final) for m in markers]
@@ -695,8 +655,9 @@ def seed_paintings(names=None):
 
 def _painting_source(name, final=None):
     """Return painting cells, saved status, and bundled source identity."""
+    versions = (False, True) if final is None else (final,)
     candidates = [(output_file(name, "painting.npy", existing=True, final=saved), saved, False)
-                  for saved in ((False, True) if final is None else (final,))]
+                  for saved in versions]
     # Raster-only user saves override bundled cell labels.
     if final is not False and not os.path.isfile(output_file(name, "labels.tif", existing=True)):
         bundled_path = annotation_path(name, "painting")
@@ -779,8 +740,11 @@ def _beside(name, final, which, cells, *, bundled=None):
         return None
     if bundled is None:
         _, _, bundled = _painting_source(name, final)
-    path = (annotation_path(name, ("painting", "accepted", "confidence")[which])
-            if bundled else painting_files(name, final, existing=True)[which])
+    if bundled:
+        kind = ("painting", "accepted", "confidence")[which]
+        path = annotation_path(name, kind)
+    else:
+        path = painting_files(name, final, existing=True)[which]
     if path and os.path.isfile(path):
         a = np.load(path, allow_pickle=False)
         if a.shape == cells.shape:
@@ -791,8 +755,10 @@ def _beside(name, final, which, cells, *, bundled=None):
 def load_accepted(name, final=None):
     """Load accepted prediction flags from the selected painting source."""
     cells, final, bundled = _painting_source(name, final)
-    a = _beside(name, final, 1, cells, bundled=bundled)
-    return np.zeros((GRID, GRID), bool) if a is None else a.astype(bool) & (cells > 0)
+    accepted = _beside(name, final, 1, cells, bundled=bundled)
+    if accepted is None:
+        return np.zeros((GRID, GRID), bool)
+    return accepted.astype(bool) & (cells > 0)
 
 
 def load_confidence(name, final=None):
@@ -801,9 +767,12 @@ def load_confidence(name, final=None):
     Set final=True for saved/bundled paintings or final=False for drafts only.
     """
     cells, final, bundled = _painting_source(name, final)
-    a = _beside(name, final, 2, cells, bundled=bundled)
-    conf = np.where(a > 0, a, SURE) if a is not None else np.full(cells.shape, SURE)
-    return np.where(cells > 0, conf, 0).astype(np.uint8)
+    confidence = _beside(name, final, 2, cells, bundled=bundled)
+    if confidence is None:
+        confidence = np.full(cells.shape, SURE)
+    else:
+        confidence = np.where(confidence > 0, confidence, SURE)
+    return np.where(cells > 0, confidence, 0).astype(np.uint8)
 
 
 def _feature_plan(dem_path):
@@ -912,8 +881,10 @@ def _source_contexts(leaves):
                 for item in pending[:]:
                     _, t, l, b, r = item
                     # Require shared edges; isolated corner contact is insufficient.
-                    if ((min(bottom, b) > max(top, t) and min(right, r) >= max(left, l))
-                            or (min(bottom, b) >= max(top, t) and min(right, r) > max(left, l))):
+                    row_overlap = min(bottom, b) - max(top, t)
+                    col_overlap = min(right, r) - max(left, l)
+                    if ((row_overlap > 0 and col_overlap >= 0)
+                            or (row_overlap >= 0 and col_overlap > 0)):
                         group.append(item)
                         pending.remove(item)
             if len(group) < 2:
@@ -991,98 +962,64 @@ def build(dem_path):
 
 def _build_local(dem_path, *, context=None):
     """Build local display layers with optional features from shared terrain."""
-    z, tr, crs, px = read(dem_path, MAX_SIDE)
-    ref = dict(height=z.shape[0], width=z.shape[1], transform=tr, crs=crs)
-    prof: dict[str, Any] = dict(driver="GTiff", dtype="uint8", count=1, nodata=255,
+    elevation, transform, crs, pixel_size = read(dem_path, MAX_SIDE)
+    ref = dict(height=elevation.shape[0], width=elevation.shape[1], transform=transform, crs=crs)
+    profile: dict[str, Any] = dict(driver="GTiff", dtype="uint8", count=1, nodata=255,
                 compress="deflate", tiled=True, blockxsize=256, blockysize=256, **ref)
 
-    zf, hole = fill_nan(z)
-    f = _terrain_features(z, px) if context is None else dict(context)
-    f.update(rel=zf - ndi.gaussian_filter(zf, window(REL_M, px)),
-             zscene=zf - np.median(zf))
+    filled, missing = fill_nan(elevation)
+    layers = _terrain_features(elevation, pixel_size) if context is None else dict(context)
+    layers.update(rel=filled - ndi.gaussian_filter(filled, window(REL_M, pixel_size)),
+                  zscene=filled - np.median(filled))
     names = list(LAYERS)
 
-    for kind, resamp in (("psr", Resampling.nearest), ("cpr", Resampling.bilinear),
-                             ("nac", Resampling.bilinear)):
-        p = companion(dem_path, kind)
-        if not p:
+    for kind, resampling in (("psr", Resampling.nearest), ("cpr", Resampling.bilinear),
+                              ("nac", Resampling.bilinear)):
+        path = companion(dem_path, kind)
+        if not path:
             continue
-        v, t2, c2, _ = read(p)
-        v = warp(v, t2, c2, ref, resamp)
-        good = np.isfinite(v)
+        values, source_transform, source_crs, _ = read(path)
+        values = warp(values, source_transform, source_crs, ref, resampling)
+        good = np.isfinite(values)
         if good.any() and kind == "cpr":       # Mask extreme companion values.
-            lo, hi = np.percentile(v[good], [0.5, 99.5])
-            v[(v < lo) | (v > hi)] = np.nan
-        f[kind] = v
+            low, high = np.percentile(values[good], [0.5, 99.5])
+            values[(values < low) | (values > high)] = np.nan
+        layers[kind] = values
         names.append(kind)
 
-    for v in f.values():
-        v[hole] = np.nan
-    X = np.stack([f[n] for n in names]).astype(np.float32)
-    hs = hillshade(zf, px)
-    hs[hole] = 0                         # Preserve missing-terrain borders in the display.
-    return X, names, hs, prof, px
+    for values in layers.values():
+        values[missing] = np.nan
+    X = np.stack([layers[name] for name in names]).astype(np.float32)
+    shade = hillshade(filled, pixel_size)
+    shade[missing] = 0
+    return X, names, shade, profile, pixel_size
 
 
 def hillshade(z, px, az=315, alt=25):
     """Calculate normalized illumination from smoothed terrain and solar angles."""
-    zs = ndi.gaussian_filter(z, 2)
-    gy, gx = np.gradient(zs, px)
-    sl, asp = np.arctan(np.hypot(gx, gy)), np.arctan2(-gy, gx)
-    return np.clip(np.sin(np.radians(alt)) * np.cos(sl) +
-                   np.cos(np.radians(alt)) * np.sin(sl) *
-                   np.cos(np.radians(az) - asp), 0, 1)
-
-
-def cell_pixels(X, cells, keep=None, per_cell=120):
-    """Sample feature rows from inside every painted cell (optionally a subset)."""
-    n, H, W = X.shape
-    rng = np.random.default_rng(0)
-    xs, ys = [], []
-    for i, j in zip(*np.nonzero(cells if keep is None else (cells * keep))):
-        r0, r1 = i * H // GRID, (i + 1) * H // GRID
-        c0, c1 = j * W // GRID, (j + 1) * W // GRID
-        blk = X[:, r0:r1, c0:c1].reshape(n, -1)
-        idx = np.flatnonzero(np.isfinite(blk[0]))     # Slope identifies valid terrain.
-        if idx.size == 0:
-            continue
-        idx = rng.choice(idx, min(per_cell, idx.size), replace=False)
-        xs.append(blk[:, idx].T)
-        ys.append(np.full(idx.size, cells[i, j]))
-    if not xs:
-        return None, None
-    return np.concatenate(xs), np.concatenate(ys)
+    smoothed = ndi.gaussian_filter(z, 2)
+    gy, gx = np.gradient(smoothed, px)
+    slope = np.arctan(np.hypot(gx, gy))
+    aspect = np.arctan2(-gy, gx)
+    illumination = (np.sin(np.radians(alt)) * np.cos(slope) +
+                    np.cos(np.radians(alt)) * np.sin(slope) *
+                    np.cos(np.radians(az) - aspect))
+    return np.clip(illumination, 0, 1)
 
 
 def blockwise(predict_rows, X, rows=256, dtype=np.uint8, fill=255):
     """Predict raster rows in blocks, using fill where the first feature is missing."""
-    n, H, W = X.shape
-    out = np.full((H, W), fill, dtype)
-    for r0 in range(0, H, rows):
-        r1 = min(H, r0 + rows)
-        blk = X[:, r0:r1].reshape(n, -1).T
-        ok = np.isfinite(blk[:, 0])           # Slope identifies valid terrain.
-        row = np.full(blk.shape[0], fill, dtype)
-        if ok.any():
-            row[ok] = predict_rows(blk[ok]).astype(dtype)
-        out[r0:r1] = row.reshape(r1 - r0, W)
+    features, height, width = X.shape
+    out = np.full((height, width), fill, dtype)
+    for start in range(0, height, rows):
+        stop = min(height, start + rows)
+        block = X[:, start:stop].reshape(features, -1).T
+        valid = np.isfinite(block[:, 0])           # Slope identifies valid terrain.
+        predictions = np.full(block.shape[0], fill, dtype)
+        if valid.any():
+            predictions[valid] = predict_rows(block[valid]).astype(dtype)
+        out[start:stop] = predictions.reshape(stop - start, width)
     return out
-
-
-def train(X, Xs, cells):
-    """Fit the selected backend and predict a preview raster.
-
-    Return (None, None) when fewer than two terrain units are available.
-    """
-    model = backend().fit(X, cells)
-    if model is None:
-        return None, None
-    return model, backend().predict(model, Xs)
-
-
-def predict(model, X):
-    """Predict terrain units with the selected model backend."""
-    return backend().predict(model, X)
 
 
 def per_pixel(values, shape):
